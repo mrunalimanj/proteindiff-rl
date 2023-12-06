@@ -498,6 +498,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         l1: float = 0.0,
         circle_reg: float = 0.0,
         epochs: int = 1,
+        method: str = "reinforce",
         steps_per_epoch: int = 250,  # Dummy value
         lr_scheduler: LR_SCHEDULE = None,
         write_preds_to_dir: Optional[str] = None,
@@ -507,6 +508,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         BertForDiffusionBase.__init__(self, **kwargs)
         # Store information about leraning rates and loss
         self.learning_rate = lr
+        self.method = method,
         # loss function is either a callable or a list of callables
         if isinstance(loss, str):
             logging.info(
@@ -679,6 +681,12 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
 
         return torch.stack(loss_terms)
     
+    def loss(self, batch):
+        if self.method == "reinforce":
+            return reinforce(batch)
+        elif self.method == "vanilla":
+            return vanilla_pg(batch)
+    
 
     def training_step(self, batch, batch_idx):
         """
@@ -686,11 +694,24 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         Modified thanks to the PyTorch Lightning Docs! 
         https://github.com/Lightning-Universe/lightning-bolts/blob/0.5.0/pl_bolts/models/rl/reinforce_model.py#L26-L302
         """
-        
-        loss_terms = reinforce(batch["log_probs"], batch["rewards"])
+
+        loss_terms = self.loss(batch) # mean here, instead of in self.loss
+        avg_loss = torch.mean(loss_terms)
+
+        # TODO: what do I want to log: 
+        # - the average reward across trajectories
+        # - the average loss across trajectories
+
 
         # loss_terms = self._get_loss_terms(batch)
         avg_loss = torch.mean(loss_terms)
+
+        log = {
+            # "episodes": self.done_episodes,
+            "avg_loss": avg_loss,
+            "avg_reward": batch["rewards"].mean(),
+        }
+
 
         # L1 loss implementation
         if self.l1_lambda > 0:

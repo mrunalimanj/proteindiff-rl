@@ -309,12 +309,16 @@ def train_again(
     # Related to training strategy
     gradient_clip: float = 1.0,  # From BERT trainer
     batch_size: int = 64, 
-    sampling_batch_size: int = 512, 
     loss: modelling.LOSS_KEYS = "smooth_l1",
     min_epochs: Optional[int] = 1,
     max_epochs: int = 5,
     early_stop_patience: int = 0,  # Set to 0 to disable early stopping
     use_swa: bool = False,  # Stochastic weight averaging can improve training genearlization
+    ## related to learning method
+    method: str = "reinforce", # TODO: where is the seed set?
+    lengths: Tuple[int, int] = (100, 128), # TODO: make passable argument
+    num: int = 2,
+    sampling_batch_size: int = 512, 
     # Misc. and debugging
     multithread: bool = True,
     subset: Union[bool, int] = False,  # Subset to n training examples
@@ -420,6 +424,7 @@ def train_again(
     ## TODO: need to ensure this has the proper training protocol!
     # Used BertForDiffusionBase?
     model = finetuning.BertForDiffusion.from_dir(from_ckpt_dir, copy_to=new_results_dir)
+    model.method = method
     loss_fn = loss
     if single_angle_debug > 0 or single_timestep_debug or syn_noiser:
         loss_fn = functools.partial(losses.radian_smooth_l1_loss, beta=0.1 * np.pi)
@@ -470,13 +475,10 @@ def train_again(
         # samples
         # use code in foldingdiff/sampling.py and bin/sample.py to help produce samples from this model
         # score the samples x_0, stored as directory of sequences.
-
-        args = {
-            "model": model,
-            "model_path": from_ckpt_dir,
-            "device": "cuda", # just use all the available ones :)
-            "seed": 0,
-            "outdir": new_results_dir, 
+        # 
+        device = "cuda"
+        seed = 0,
+        
             "lengths": [100, 128], # TODO: make passable argument
             "num": 2, # TODO: make passable argument
             "batch_size": sampling_batch_size
@@ -485,33 +487,30 @@ def train_again(
         # Load the dataset based on training args
         train_dset, _, test_dset = build_datasets(
             # load_actual is only true if we want comparison done on a particular test set ! 
-            Path(args["model_path"]), load_actual=False,
+            Path(from_ckpt_dir), load_actual=False,
         )
         phi_idx = test_dset.feature_names["angles"].index("phi")
         psi_idx = test_dset.feature_names["angles"].index("psi")
         # Fetch values for training distribution
         select_by_attn = lambda x: x["angles"][x["attn_mask"] != 0]
 
-        # Load the model
-        model_snapshot_dir = Path(args["outdir"]) / "model_snapshot"
-
         # model is already loaded 
-        model = model.to(torch.device(args["device"]))
+        model = model.to(torch.device(device))
 
 
-        sweep_min_len, sweep_max_len = args["lengths"]
+        sweep_min_len, sweep_max_len = lengths
         assert sweep_min_len < sweep_max_len
         assert sweep_max_len <= train_dset.dset.pad
 
         # what is the train_dset?
         # Perform sampling
-        torch.manual_seed(args["seed"])
+        torch.manual_seed(seed)
         sampled, log_probs = sampling.sample(
             model,
             train_dset,
-            n=args["num"],
+            n=num,
             sweep_lengths=(sweep_min_len, sweep_max_len),
-            batch_size=args["batch_size"]
+            batch_size=sampling_batch_size
         )
 
         final_sampled = [s[-1] for s in sampled]
@@ -522,7 +521,7 @@ def train_again(
     
     
     # Custom LightningDataModule
-    class MyDataModule(LightningDataModule):
+    class OnlineTrajectories(LightningDataModule):
         def __init__(self, batch_size, model, max_epochs=200):
             super().__init__()
             self.batch_size = batch_size
@@ -556,15 +555,11 @@ def train_again(
         def train_dataloader(self):
             return DataLoader(self.generate_batches(), batch_size=self.batch_size)
 
-    # Usage example: # TODO: change this! I don't know exactly how yet but.
-    batch_size = 32
-
     # Create an instance of the custom data module
-    data_module = MyDataModule(batch_size)
+    data_module = OnlineTrajectories(sampling_batch_size)
 
     # Access the DataLoader for training
     new_train_dataloader = data_module.train_dataloader()
-
 
     # <----------------------------------  model TRAINING  ----------------------------------> 
     trainer.fit(
