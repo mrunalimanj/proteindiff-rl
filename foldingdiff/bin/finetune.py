@@ -549,7 +549,8 @@ def train_again(
             return DataLoader(self.generate_batches(), batch_size=self.batch_size)
 
     # Create an instance of the custom data module
-    data_module = OnlineTrajectories(sampling_batch_size)
+    data_module = OnlineTrajectories(batch_size=sampling_batch_size,
+                                     model=model)
 
     # Access the DataLoader for training
     new_train_dataloader = data_module.train_dataloader()
@@ -557,7 +558,7 @@ def train_again(
     # <----------------------------------  model TRAINING  ----------------------------------> 
     trainer.fit(
         model=model,
-        train_dataloaders=new_train_dataloader,
+        # train_dataloaders=new_train_dataloader,
         # val_dataloaders=valid_dataloader, I don't think we need a validation dataloader? 
     )
 

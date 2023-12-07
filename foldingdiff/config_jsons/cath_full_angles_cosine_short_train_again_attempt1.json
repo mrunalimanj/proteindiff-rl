@@ -1,5 +1,5 @@
 {
-    "from_ckpt_dir": "/home/mrunali/project/foldingdiff/retrain_546",
+    "from_ckpt_dir": "/home/mrunali/project/proteindiff-rl/model_runs/retrain_546",
     "angles_definitions": "canonical-full-angles",
     "timesteps": 1000,
     "max_seq_len": 128,
