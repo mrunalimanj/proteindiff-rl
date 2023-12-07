@@ -33,7 +33,6 @@ from huggingface_hub import snapshot_download
 
 from train import get_train_valid_test_sets
 from rewards import * 
-from sample import build_datasets
 
 from foldingdiff import datasets
 from foldingdiff import modelling
@@ -45,9 +44,7 @@ from foldingdiff import plotting
 from foldingdiff import utils
 from foldingdiff import custom_metrics as cm
 
-from torch.utils.data import DataLoader, TensorDataset
-from pytorch_lightning import LightningDataModule
-
+from torch.utils.data import DataLoader
 
 
 assert torch.cuda.is_available(), "Requires CUDA to train"
@@ -342,7 +339,7 @@ def train_again(
     # <----------------------------------  dataset  ----------------------------------> 
     new_results_folder = Path(new_results_dir)
     record_args_and_metadata(func_args, new_results_folder)
-
+    """
     # Get datasets and wrap them in dataloaders
     dsets = get_train_valid_test_sets(
         dataset_key=dataset_key,
@@ -370,6 +367,7 @@ def train_again(
         dset_name = ["train", "valid", "test"][i]
         with open(new_results_folder / f"{dset_name}_files.txt", "w") as f:
             f.write("\n".join(dset.dset.filenames))
+    """
 
     # Calculate effective batch size
     # https://pytorch-lightning.readthedocs.io/en/1.4.0/advanced/multi_gpu.html#batch-size
@@ -380,7 +378,7 @@ def train_again(
     pl.utilities.rank_zero_info(
         f"Given batch size: {batch_size} --> effective batch size with {torch.cuda.device_count()} GPUs: {effective_batch_size}"
     )
-
+    """
     train_dataloader, valid_dataloader, test_dataloader = [
         DataLoader(
             dataset=ds,
@@ -391,13 +389,15 @@ def train_again(
         )
         for i, ds in enumerate(dsets)
     ]
-    
+    """
+        
 
     # <----------------------------------  plotting  ----------------------------------> 
     # Create plots in output directories of distributions from different timesteps
     plots_folder = new_results_folder / "plots"
     os.makedirs(plots_folder, exist_ok=True)
     # Skip this for debug runs
+    """
     if (
         single_angle_debug < 0
         and not single_timestep_debug
@@ -410,16 +410,17 @@ def train_again(
             timesteps=timesteps,
             plots_folder=plots_folder,
         )
-
+    """
     # https://jaketae.github.io/study/relative-positional-encoding/
     # looking at the relative distance between things is more robust
 
     # <----------------------------------  loss parameters?  ----------------------------------> 
     # Shape of the input is (batch_size, timesteps, features)
-    
+    """
     sample_input = dsets[0][0]["corrupted"]  # First item of the training dset
     model_n_inputs = sample_input.shape[-1]
-    logging.info(f"Auto detected {model_n_inputs} inputs")
+    logging.info(f"Auto detected {model_n_inputs} inputs") # TODO: Find a different metric to log. 
+    """
 
     # ft_is_angular from the clean datasets angularity definition
     ft_key = "coords" if angles_definitions == "cart-coords" else "angles"
@@ -459,7 +460,7 @@ def train_again(
         check_val_every_n_epoch=1,
         callbacks=callbacks,
         logger=pl.loggers.CSVLogger(save_dir=new_results_folder / "logs"),
-        log_every_n_steps=min(200, len(train_dataloader)),  # Log >= once per epoch
+        log_every_n_steps=32, # min(200, len(train_dataloader)),  # Log >= once per epoch
         accelerator=accelerator,
         strategy=strategy,
         gpus=ngpu,
@@ -472,90 +473,9 @@ def train_again(
     # Assume you have an environment that generates trajectories
     # Function to generate trajectories: need the sequence of states, the final reward, and log probability
 
-    def get_trajectories_with_model(model):
-        # samples
-        # use code in foldingdiff/sampling.py and bin/sample.py to help produce samples from this model
-        # score the samples x_0, stored as directory of sequences.
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        # Load the dataset based on training args
-        train_dset, _, test_dset = build_datasets(
-            # load_actual is only true if we want comparison done on a particular test set ! 
-            Path(from_ckpt_dir), load_actual=False,
-        )
-        phi_idx = test_dset.feature_names["angles"].index("phi")
-        psi_idx = test_dset.feature_names["angles"].index("psi")
-        # Fetch values for training distribution
-        select_by_attn = lambda x: x["angles"][x["attn_mask"] != 0]
-
-        # model is already loaded 
-        model = model.to(torch.device(device))
-
-
-        sweep_min_len, sweep_max_len = lengths
-        assert sweep_min_len < sweep_max_len
-        assert sweep_max_len <= train_dset.dset.pad
-
-        # what is the train_dset?
-        # Perform sampling
-        sampled, log_probs = sampling.sample(
-            model,
-            train_dset,
-            n=num,
-            sweep_lengths=(sweep_min_len, sweep_max_len),
-            batch_size=sampling_batch_size
-        )
-
-        final_sampled = [s[-1] for s in sampled]
-
-        rewards = [np.random.normal(3, 5) for _ in final_sampled] # compute_scTM_scores(final_sampled)
-        
-        return sampled, rewards, log_probs
     
-    
-    # Custom LightningDataModule
-    class OnlineTrajectories(LightningDataModule):
-        def __init__(self, batch_size, model, max_epochs=200):
-            super().__init__()
-            self.batch_size = batch_size
-            self.max_epochs = max_epochs 
-            # batch_size * max_epochs is the number of total trajectories we use over all time 
-            # trajectory:reward mapping is one to one, so collapse as needed above if redundant geneations
-            # why? we need to take expectation over trajectories and corresponding rewards
-            
-            self.model = model # I think we can store still a pointer to the model as it updates
-            self.generate_trajectory = get_trajectories_with_model # the function, not the call itself w model. 
-
-        def generate_batches(self):
-            # AHHHH! You can generate a couple ahead of time, I think.
-            # TODO: Come back to https://github.com/Lightning-Universe/lightning-bolts/blob/0.5.0/pl_bolts/models/rl/reinforce_model.py#L26-L302
-            # There should be some training cap right? 
-            for _ in range(self.max_epochs):  # NOT an infinite loop for online learning
-                # Generate a single trajectory
-                states, rewards, log_probs = self.generate_trajectory(self.model)
-                
-                # Convert to PyTorch tensors
-                states_tensor = torch.tensor(states, dtype=torch.float32)
-                rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
-                log_probs_tensor = torch.tensor(log_probs, dtype=torch.float32)
-                
-                # Create a dataset from the trajectory
-                dataset = TensorDataset(states_tensor, rewards_tensor, log_probs_tensor)
-                
-                # Yield the dataset
-                yield dataset
-        
-        def train_dataloader(self):
-            return DataLoader(self.generate_batches(), batch_size=self.batch_size)
-
-    # Create an instance of the custom data module
-    data_module = OnlineTrajectories(batch_size=sampling_batch_size,
-                                     model=model)
-
-    # Access the DataLoader for training
-    new_train_dataloader = data_module.train_dataloader()
-
     # <----------------------------------  model TRAINING  ----------------------------------> 
+    model.set_rl_train_params(from_ckpt_dir, lengths, num, sampling_batch_size)
     trainer.fit(
         model=model,
         # train_dataloaders=new_train_dataloader,

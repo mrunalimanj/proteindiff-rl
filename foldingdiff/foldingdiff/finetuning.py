@@ -17,6 +17,8 @@ from typing import *
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.data import DataLoader, TensorDataset
+
 
 import pytorch_lightning as pl
 
@@ -33,6 +35,8 @@ from tqdm.auto import tqdm
 from foldingdiff import losses, nerf
 from foldingdiff.datasets import FEATURE_SET_NAMES_TO_ANGULARITY
 from foldingdiff.policy_gradient_fns import *
+from foldingdiff.sampling_utils import * 
+from foldingdiff import sampling
 
 LR_SCHEDULE = Optional[Literal["OneCycleLR", "LinearWarmup"]]
 TIME_ENCODING = Literal["gaussian_fourier", "sinusoidal"]
@@ -830,6 +834,76 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
                 raise ValueError(f"Unknown lr scheduler {self.lr_scheduler}")
         pl.utilities.rank_zero_info(f"Using optimizer {retval}")
         return retval
+    
+    def set_rl_train_params(self, from_ckpt_dir, lengths, num, sampling_batch_size):
+        self.from_ckpt_dir = from_ckpt_dir
+        self.lengths = lengths
+        self.num = num
+        self.sampling_batch_size = sampling_batch_size
+    
+    def __dataloader(self) -> DataLoader:
+        ## Creates a new set of trajectories? 
+        # TODO: Come back to https://github.com/Lightning-Universe/lightning-bolts/blob/0.5.0/pl_bolts/models/rl/reinforce_model.py#L26-L302
+        """Initialize the dataset used for getting experiences"""
+        # samples
+        # use code in foldingdiff/sampling.py and bin/sample.py to help produce samples from this model
+        # score the samples x_0, stored as directory of sequences.
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # Load the dataset based on training args
+        train_dset, _, test_dset = build_datasets(
+            # load_actual is only true if we want comparison done on a particular test set ! 
+            Path(self.from_ckpt_dir), load_actual=False,
+        )
+        phi_idx = test_dset.feature_names["angles"].index("phi")
+        psi_idx = test_dset.feature_names["angles"].index("psi")
+        # Fetch values for training distribution
+        select_by_attn = lambda x: x["angles"][x["attn_mask"] != 0]
+
+        # model is already loaded 
+        self = self.to(torch.device(device))
+
+
+        sweep_min_len, sweep_max_len = self.lengths
+        assert sweep_min_len < sweep_max_len
+        assert sweep_max_len <= train_dset.dset.pad
+
+        # what is the train_dset?
+        # Perform sampling
+        sampled, log_probs = sampling.sample(
+            self,
+            train_dset,
+            n=self.num,
+            sweep_lengths=(sweep_min_len, sweep_max_len),
+            batch_size=self.sampling_batch_size
+        )
+
+        final_sampled = [s[-1] for s in sampled]
+
+        rewards = [np.random.normal(3, 5) for _ in final_sampled] # compute_scTM_scores(final_sampled)
+
+        sampled, rewards, log_probs
+
+        # I can't cast to a tensor... how to fix. 
+        # 
+
+        samples_tensor = torch.nested.nested_tensor(sampled, dtype=torch.float32) # TODO: is this the right type
+        rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
+        log_probs_tensor = torch.nested.nested_tensor(log_probs, dtype=torch.float32)
+        
+        # Create a dataset from the trajectory
+        dataset = TensorDataset(samples_tensor, rewards_tensor, log_probs_tensor)
+        
+        dataloader = DataLoader(
+            dataset=dataset,
+            batch_size=self.batch_size,
+            sampler=None,
+        )
+        return dataloader
+
+    def train_dataloader(self) -> DataLoader:
+        """Get train loader"""
+        return self.__dataloader()
 
 
 class BertForAutoregressiveBase(BertForDiffusionBase):
