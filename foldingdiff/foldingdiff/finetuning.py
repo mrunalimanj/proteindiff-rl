@@ -706,14 +706,14 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         # - the average reward across trajectories
         # - the average loss across trajectories
 
-
+        samples, rewards, log_probs = batch
         # loss_terms = self._get_loss_terms(batch)
         avg_loss = torch.mean(loss_terms)
 
         log = {
             # "episodes": self.done_episodes,
             "avg_loss": avg_loss,
-            "avg_reward": batch["rewards"].mean(),
+            "avg_reward": rewards.mean(),
         }
 
 
@@ -721,6 +721,8 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         if self.l1_lambda > 0:
             l1_penalty = sum(torch.linalg.norm(p, 1) for p in self.parameters())
             avg_loss += self.l1_lambda * l1_penalty
+
+        print(self.ft_names)
 
         pseudo_ft_names = (
             (self.ft_names + ["pairwise_dist_loss"])
@@ -868,19 +870,22 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         assert sweep_min_len < sweep_max_len
         assert sweep_max_len <= train_dset.dset.pad
 
+        # maybe pick a random length to use each time???
+        length_to_use = np.random.choice(range(sweep_min_len, sweep_max_len))
+
         # what is the train_dset?
         # Perform sampling
         sampled, log_probs = sampling.sample(
             self,
             train_dset,
             n=self.num,
-            sweep_lengths=(sweep_min_len, sweep_max_len),
+            sweep_lengths=(length_to_use, length_to_use + 1),
             batch_size=self.sampling_batch_size
         )
 
         final_sampled = [s[-1] for s in sampled]
 
-        rewards = [np.random.normal(3, 5) for _ in final_sampled] # compute_scTM_scores(final_sampled)
+        rewards = torch.tensor([np.random.normal(3, 5) for _ in final_sampled], device=device) # compute_scTM_scores(final_sampled)
 
         sampled, rewards, log_probs
 
@@ -896,7 +901,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         
         dataloader = DataLoader(
             dataset=dataset,
-            batch_size=self.batch_size,
+            batch_size=self.sampling_batch_size,
             sampler=None,
         )
         return dataloader
