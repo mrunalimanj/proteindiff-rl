@@ -1,3 +1,5 @@
 foldingdiff/data/
 foldingdiff/.gitmodules
 foldingdiff/.ipynb_checkpoints/
+foldingdiff/plots/
+model_runs/

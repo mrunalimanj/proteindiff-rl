@@ -45,6 +45,10 @@ from foldingdiff import plotting
 from foldingdiff import utils
 from foldingdiff import custom_metrics as cm
 
+from torch.utils.data import DataLoader, TensorDataset
+from pytorch_lightning import LightningDataModule
+
+
 
 assert torch.cuda.is_available(), "Requires CUDA to train"
 # reproducibility
@@ -464,9 +468,6 @@ def train_again(
     )
 
     # <----------------------------------  New, on-the-fly dataloader ------------------------------->
-    import torch
-    from torch.utils.data import DataLoader, TensorDataset
-    from pytorch_lightning import LightningDataModule
 
     # Assume you have an environment that generates trajectories
     # Function to generate trajectories: need the sequence of states, the final reward, and log probability
@@ -475,14 +476,7 @@ def train_again(
         # samples
         # use code in foldingdiff/sampling.py and bin/sample.py to help produce samples from this model
         # score the samples x_0, stored as directory of sequences.
-        # 
-        device = "cuda"
-        seed = 0,
-        
-            "lengths": [100, 128], # TODO: make passable argument
-            "num": 2, # TODO: make passable argument
-            "batch_size": sampling_batch_size
-        }
+        device = "cuda" if torch.cuda.is_available() else "cpu"
 
         # Load the dataset based on training args
         train_dset, _, test_dset = build_datasets(
@@ -504,7 +498,6 @@ def train_again(
 
         # what is the train_dset?
         # Perform sampling
-        torch.manual_seed(seed)
         sampled, log_probs = sampling.sample(
             model,
             train_dset,
@@ -515,7 +508,7 @@ def train_again(
 
         final_sampled = [s[-1] for s in sampled]
 
-        rewards = compute_scTM_scores(final_sampled)
+        rewards = [np.random.normal(3, 5) for _ in final_sampled] # compute_scTM_scores(final_sampled)
         
         return sampled, rewards, log_probs
     
