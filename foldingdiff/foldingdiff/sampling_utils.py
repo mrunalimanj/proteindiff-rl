@@ -17,6 +17,7 @@ import tempfile
 from typing import *
 import numpy as np
 from tqdm.auto import tqdm
+import re
 
 
 from huggingface_hub import snapshot_download
@@ -265,6 +266,7 @@ class RewardStructure():
     def write_preds_pdb_folder(
         self, 
         final_sampled: Sequence[pd.DataFrame],
+        device, 
         feature_names = ["phi", "psi", "omega", "tau", "CA:C:1N", "C:1N:1CA"],
         basename_prefix: str = "generated_",
         threads: int = mp.cpu_count(),
@@ -284,7 +286,7 @@ class RewardStructure():
         pd.DataFrame(s, columns=feature_names)
         for s in final_sampled]
         arg_tuples = [
-            (os.path.join(gen_pdb_outdir, f"{basename_prefix}{i}.pdb"), samp)
+            (os.path.join(gen_pdb_outdir, f"{basename_prefix}{i}_dev_{device}.pdb"), samp)
             for i, samp in enumerate(sampled_dfs)
         ]
         # Write in parallel
@@ -328,7 +330,7 @@ class RewardStructure():
         return seq_dict
 
 
-    def update_fname(self, fname: str, i: int, new_dir: str = "") -> str:
+    def update_fname(self, fname: str, i: int, device,  new_dir: str = "",) -> str:
         """
         Update the pdb filename to include a numeric index and a .fasta extension.
         If new_dir is given then we move the output filename to that directory.
@@ -341,7 +343,7 @@ class RewardStructure():
         if new_dir:
             assert os.path.isdir(new_dir), f"Expected {new_dir} to be a directory"
             parent = new_dir
-        return os.path.join(parent, f"{child_base}_proteinmpnn_residues_{i}.fasta")
+        return os.path.join(parent, f"{child_base}_dev_{device}_proteinmpnn_residues_{i}.fasta")
 
 
     def generate_residues_proteinmpnn(
@@ -371,7 +373,7 @@ class RewardStructure():
         return list(seqs.values())
 
 
-    def pdbs_to_seqs(self, pdb_fnames: List[str], ) -> List[str]:
+    def pdbs_to_seqs(self, pdb_fnames: List[str], device) -> List[str]:
         """
         For each pdb file in the given list, generate sequences using ProteinMPNN and write them to a fasta file.
         Returns a list of the fasta files written.
@@ -382,16 +384,16 @@ class RewardStructure():
             seqs = self.generate_residues_proteinmpnn(
                 pdb_fname, n_sequences=self.config["mpnn_replicates"], temperature=0.8
             )
-            file_names_pdb_i = []
+            # file_names_pdb_i = []
             for i, seq in enumerate(seqs):
-                out_fname = self.update_fname(pdb_fname, i, new_dir=self.config["mpnn_outdir"])
+                out_fname = self.update_fname(pdb_fname, i, device=device, new_dir=self.config["mpnn_outdir"])
                 self.write_fasta_mpnn(
                     out_fname, seq, seqname=os.path.splitext(os.path.basename(out_fname))[0] # TODO: make sure this is right. 
                 )
-                file_names_pdb_i.append(out_fname)
-                proteinmpnn_seqs_written.append(file_names_pdb_i)
+                # file_names_pdb_i.append(out_fname)
+                proteinmpnn_seqs_written.append(out_fname)
 
-        print(proteinmpnn_seqs_written)
+        # print(proteinmpnn_seqs_written)
 
         return proteinmpnn_seqs_written
 
@@ -461,18 +463,20 @@ class RewardStructure():
 
         bname = os.path.splitext(os.path.basename(input_fasta))[0]
         with open(
-            os.path.join(outdir, f"omegafold_{bname}_gpu_{gpu}.stdout"), "wb"
+            os.path.join(outdir, f"omegafold_{bname}_gpu_reassign_{gpu}.stdout"), "wb"
         ) as sink:
             output = subprocess.call(cmd, shell=True, stdout=sink)
 
 
-    def seqs_to_structures(self, list_of_fasta_files: List[str]):
+    def seqs_to_structures(self, list_of_fasta_files: List[str], device):
         gpus = self.config["omegafold_gpus"]
+        print("the length of gpus:", len(gpus))
         outdir = self.config["omegafold_outdir"]
         # outdir=os.path.abspath(os.path.join(os.getcwd(), self.config["omegafold_outdir"])),
         # TODO: could use output directory, figure out logic for saving + storing
+        input_sequences = {}
         for fname in list_of_fasta_files:
-            fname_seqs = read_fasta(fname)
+            fname_seqs = self.read_fasta_omega(fname)
             assert fname_seqs.keys().isdisjoint(input_sequences.keys())
             input_sequences.update(fname_seqs)
         n = len(input_sequences)
@@ -484,21 +488,22 @@ class RewardStructure():
         idx = np.arange(n)
         rng = np.random.default_rng(seed=1234)
         rng.shuffle(idx)
-        idx_split = np.array_split(idx, gpus)
+        idx_split = np.array_split(idx, len(gpus))
         all_keys = list(input_sequences.keys())
         all_keys_split = [[all_keys[i] for i in part] for part in idx_split]
         # Write the tempfiles and call omegafold
 
         processes = []
         for i, key_chunk in enumerate(all_keys_split):
-            fasta_filename = os.path.join(outdir, f"{i}_omegafold_input.fasta")
+            fasta_filename = os.path.join(outdir, f"{i}_dev_{device}_omegafold_input.fasta")
             assert not os.path.exists(fasta_filename)
             logging.info(f"Writing {len(key_chunk)} sequences to {fasta_filename}")
-            write_fasta({k: input_sequences[k] for k in key_chunk}, fasta_filename)
+            self.write_fasta_omega({k: input_sequences[k] for k in key_chunk}, fasta_filename)
             proc = mp.Process(
-                target=run_omegafold,
+                target=self.run_omegafold,
                 args=(fasta_filename, outdir, gpus[i], ""),
             )
+            processes.append(proc)
             proc.start()
         for p in processes:
             p.join()
@@ -527,12 +532,17 @@ class RewardStructure():
         return tmalign.max_tm_across_refs(orig_pdb, folded_pdbs, parallel=False)
 
 
-    def score_structures(folded, predicted):
-        assert os.path.isdir(folded)
+    def score_structures(self, folded, predicted):
+        """
+        folded is the generated backbone structures, from the sampler
+        predicted is the structures from the inverse folding test"""
+        # assert os.path.isdir(folded)
         assert os.path.isdir(predicted), f"Directory not found: {predicted}"
 
         # TODO: make sure this is right
-        orig_predicted_backbones = glob.glob(os.path.join(folded, "*.pdb"))
+        print(f"folded: {folded}")
+        # perhaps need to wait until all files are done computing. 
+        orig_predicted_backbones = glob.glob(os.path.join(predicted, "*.pdb"))
         logging.info(
             f"Computing scTM scores across {len(orig_predicted_backbones)} generated structures"
         )
@@ -553,7 +563,7 @@ class RewardStructure():
             }
 
         # Match up the files
-        pfunc = functools.partial(get_sctm_score, folded_dirname=Path(folded))
+        pfunc = functools.partial(self.get_sctm_score, folded_dirname=Path(folded))
         pool = mp.Pool(mp.cpu_count())
         sctm_scores_raw_and_ref = list(
             pool.map(pfunc, orig_predicted_backbones, chunksize=5)
@@ -572,6 +582,7 @@ class RewardStructure():
             orig_predicted_backbone_names[i]: sctm_scores_raw_and_ref[i][1]
             for i in sctm_non_nan_idx
         }
+        print(sctm_scores_mapping) # this is some kind of dictionary,, 
 
         sctm_scores = np.array(list(sctm_scores_mapping.values()))
 
@@ -584,20 +595,31 @@ class RewardStructure():
         logging.info(
             f"scTM score mean/median: {np.mean(sctm_scores), np.median(sctm_scores)}"
         )
-        with open(config["sctm_score_file"] + ".json", "w") as sink:
+        with open(self.config["sctm_score_file"] + ".json", "w") as sink:
             json.dump(sctm_scores_mapping, sink, indent=4)
 
         # Need to return one score for each structure!
-        return sctm_scores
+        grouped_sctm_scores = {}
+        dev_values = set([int(re.findall(r'dev_(\d+)', file_name)[0]) for file_name in sctm_scores_mapping.keys()])
+        for key, val in sctm_scores_mapping.items():
+            dev_num = int(re.findall(r'dev_(\d+)', key)[0])
+            if dev_num not in grouped_sctm_scores:
+                grouped_sctm_scores[dev_num] = []
+            grouped_sctm_scores[dev_num].append(val)
+    
+        flattened_sctms = np.array(list(grouped_sctm_scores.values())).mean(axis=0)
+
+        return flattened_sctms
 
     # <------------------------- R_total: End-to-end computation ------------------------------------->
 
-    def compute_scTM_scores(self, final_sampled, feature_names):
-        pdbs_written = self.write_preds_pdb_folder(final_sampled, feature_names)
+    def compute_scTM_scores(self, final_sampled, feature_names, device):
+        pdbs_written = self.write_preds_pdb_folder(final_sampled, feature_names = feature_names, device=device)
+        mpnns_written = self.pdbs_to_seqs(pdbs_written, device=device)
         # above is debugged 
-        mpnns_written = self.pdbs_to_seqs(pdbs_written)
-        assert 0 == 1
-        #new_pdbs = self.seqs_to_structures(mpnns_written)
-        # rewards = self.score_structures(pdbs_written, new_pdbs)
-
+        self.seqs_to_structures(mpnns_written,device=device)
+        orig_pdb_folder = self.config["gen_pdb_outdir"]
+        new_pdbs_folder = self.config["omegafold_outdir"]
+        rewards = self.score_structures(predicted = orig_pdb_folder, folded = new_pdbs_folder)
+        print(rewards)
         return rewards 

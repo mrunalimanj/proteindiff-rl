@@ -903,20 +903,24 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         final_sampled = [s[-1] for s in sampled]
 
         rewards = self.reward_fn.compute_scTM_scores(final_sampled = final_sampled,
-                                                    feature_names = train_dset.feature_names["angles"])
+                                                    feature_names = train_dset.feature_names["angles"], 
+                                                    device = torch.cuda.current_device())
 
 
         #rewards = torch.tensor([np.random.normal(3, 5) for _ in final_sampled], device=device) # compute_scTM_scores(final_sampled)
 
         sampled, rewards, log_probs
 
-        # I can't cast to a tensor... how to fix. 
-        # 
+        # First you gotta optimize the training loop
+        # And also make sure it learns!! AKA has gradients!!
 
         samples_tensor = torch.nested.nested_tensor(sampled, dtype=torch.float32) # TODO: is this the right type
         rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
         log_probs_tensor = torch.nested.nested_tensor(log_probs, dtype=torch.float32)
         
+        print(len(sampled), rewards_tensor.shape, len(log_probs))
+        # so, I need to 1) collect rewards by the redunancy I have?
+        # Then average along that dimension
         # Create a dataset from the trajectory
         dataset = TensorDataset(samples_tensor, rewards_tensor, log_probs_tensor)
         

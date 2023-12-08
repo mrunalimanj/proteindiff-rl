@@ -318,14 +318,14 @@ def train_again(
     ## related to learning method
     method: str = "reinforce", # TODO: where is the seed set?
     lengths: Tuple[int, int] = (100, 128), 
-    sampling_num: int = 2,
+    sampling_num: int = 3,
     sampling_batch_size: int = 512, 
 
     ## related to reward function
     gen_pdb_outdir: str = 'gen_pdb_temp', 
     mpnn_replicates: int = 8,
     mpnn_outdir: str = "gen_mpnn_temp",
-    omegafold_gpus: int = 1, 
+    omegafold_gpus: List = [1], 
     omegafold_outdir: str = "folded_pdb_temp", 
     sctm_score_file: str = "sctm_temp",
 
@@ -728,7 +728,7 @@ def train_old(
     metrics_csv = os.path.join(
         trainer.logger.save_dir, "lightning_logs/version_0/metrics.csv"
     )
-    assert os.path.isfile(metrics_csv)
+    # assert os.path.isfile(metrics_csv)
     # Plot the losses
     plotting.plot_losses(
         metrics_csv, out_fname=plots_folder / "losses.pdf", simple=True
