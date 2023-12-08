@@ -317,9 +317,18 @@ def train_again(
     use_swa: bool = False,  # Stochastic weight averaging can improve training genearlization
     ## related to learning method
     method: str = "reinforce", # TODO: where is the seed set?
-    lengths: Tuple[int, int] = (100, 128), # TODO: make passable argument
-    num: int = 2,
+    lengths: Tuple[int, int] = (100, 128), 
+    sampling_num: int = 2,
     sampling_batch_size: int = 512, 
+
+    ## related to reward function
+    gen_pdb_outdir: str = 'gen_pdb_temp', 
+    mpnn_replicates: int = 8,
+    mpnn_outdir: str = "gen_mpnn_temp",
+    omegafold_gpus: int = 1, 
+    omegafold_outdir: str = "folded_pdb_temp", 
+    sctm_score_file: str = "sctm_temp",
+
     # Misc. and debugging
     multithread: bool = True,
     subset: Union[bool, int] = False,  # Subset to n training examples
@@ -475,7 +484,9 @@ def train_again(
 
     
     # <----------------------------------  model TRAINING  ----------------------------------> 
-    model.set_rl_train_params(from_ckpt_dir, lengths, num, sampling_batch_size)
+    model.set_rl_train_config(from_ckpt_dir, lengths, sampling_num, sampling_batch_size)
+    model.set_reward_config(new_results_dir, gen_pdb_outdir, mpnn_replicates, mpnn_outdir,
+            omegafold_gpus, omegafold_outdir, sctm_score_file)
     trainer.fit(
         model=model,
         # train_dataloaders=new_train_dataloader,
@@ -792,7 +803,8 @@ if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
         handlers=[
-            logging.FileHandler(f"train_again_{curr_time}.log"),
+            #logging.FileHandler(f"train_again_{curr_time}.log"),
+            logging.FileHandler(f"debugging_reward.log"), #TODO: change back 
             logging.StreamHandler(),
         ],
     )

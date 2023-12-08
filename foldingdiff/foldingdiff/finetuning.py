@@ -837,11 +837,28 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         pl.utilities.rank_zero_info(f"Using optimizer {retval}")
         return retval
     
-    def set_rl_train_params(self, from_ckpt_dir, lengths, num, sampling_batch_size):
+    def set_rl_train_config(self, from_ckpt_dir, lengths, num, sampling_batch_size):
         self.from_ckpt_dir = from_ckpt_dir
         self.lengths = lengths
         self.num = num
         self.sampling_batch_size = sampling_batch_size
+
+
+    def set_reward_config(self, 
+            new_results_dir,
+            gen_pdb_outdir, mpnn_replicates, mpnn_outdir,
+            omegafold_gpus, omegafold_outdir, sctm_score_file): # TODO: fix args 
+        self.reward_config = {
+            "new_results_dir": new_results_dir,
+            "gen_pdb_outdir": gen_pdb_outdir,
+            "mpnn_replicates": mpnn_replicates,
+            "mpnn_outdir": mpnn_outdir,
+            "omegafold_gpus": omegafold_gpus,
+            "omegafold_outdir": omegafold_outdir,
+            "sctm_score_file": sctm_score_file,
+
+        }
+        self.reward_fn = RewardStructure(self.reward_config)
     
     def __dataloader(self) -> DataLoader:
         ## Creates a new set of trajectories? 
@@ -885,7 +902,11 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
 
         final_sampled = [s[-1] for s in sampled]
 
-        rewards = torch.tensor([np.random.normal(3, 5) for _ in final_sampled], device=device) # compute_scTM_scores(final_sampled)
+        rewards = self.reward_fn.compute_scTM_scores(final_sampled = final_sampled,
+                                                    feature_names = train_dset.feature_names["angles"])
+
+
+        #rewards = torch.tensor([np.random.normal(3, 5) for _ in final_sampled], device=device) # compute_scTM_scores(final_sampled)
 
         sampled, rewards, log_probs
 
