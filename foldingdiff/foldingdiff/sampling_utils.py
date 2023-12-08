@@ -9,7 +9,7 @@ import logging
 import functools
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset
 import glob
 import argparse
 import subprocess
@@ -97,6 +97,23 @@ FT_NAME_MAP = {
     "C:1N:1CA": r"$\theta_3$",
 }
 
+
+
+class TrajectoryDataset(IterableDataset):
+    """Basic experience source dataset.
+
+    Takes a generate_batch function that returns an iterator. When given a generate_batch function, will produce trajectories on the fly. 
+    """
+
+    def __init__(self, generate_batch: Callable) -> None:
+        self.generate_batch = generate_batch
+
+    def __iter__(self) -> Iterator:
+        iterator = self.generate_batch()
+        return iterator
+
+        
+    
 
 def get_train_valid_test_sets(
     dataset_key: str = "cath",
@@ -493,7 +510,7 @@ class RewardStructure():
         processes = []
         for i, key_chunk in enumerate(all_keys_split):
             fasta_filename = os.path.join(outdir, f"{i}_dev_{device}_omegafold_input.fasta")
-            assert not os.path.exists(fasta_filename)
+            # assert not os.path.exists(fasta_filename)
             logging.info(f"Writing {len(key_chunk)} sequences to {fasta_filename}")
             self.write_fasta_omega({k: input_sequences[k] for k in key_chunk}, fasta_filename)
             proc = mp.Process(
@@ -612,6 +629,7 @@ class RewardStructure():
         mpnns_written = self.pdbs_to_seqs(pdbs_written, device=device)
         # above is debugged 
         self.seqs_to_structures(mpnns_written,device=device)
+        print("rewards successfully computed for this epoch?")
         orig_pdb_folder = self.config["gen_pdb_outdir"]
         new_pdbs_folder = self.config["omegafold_outdir"]
         rewards = self.score_structures(predicted = orig_pdb_folder, folded = new_pdbs_folder)

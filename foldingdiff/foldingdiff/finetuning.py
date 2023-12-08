@@ -17,7 +17,8 @@ from typing import *
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, IterableDataset
+
 
 
 import pytorch_lightning as pl
@@ -698,7 +699,6 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         Modified thanks to the PyTorch Lightning Docs! 
         https://github.com/Lightning-Universe/lightning-bolts/blob/0.5.0/pl_bolts/models/rl/reinforce_model.py#L26-L302
         """
-
         loss_terms = self.loss(batch) # mean here, instead of in self.loss
         avg_loss = torch.mean(loss_terms)
 
@@ -860,80 +860,90 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         }
         self.reward_fn = RewardStructure(self.reward_config)
     
-    def __dataloader(self) -> DataLoader:
-        ## Creates a new set of trajectories? 
-        # TODO: Come back to https://github.com/Lightning-Universe/lightning-bolts/blob/0.5.0/pl_bolts/models/rl/reinforce_model.py#L26-L302
-        """Initialize the dataset used for getting experiences"""
+    def trajectory_batch(self):
         # samples
         # use code in foldingdiff/sampling.py and bin/sample.py to help produce samples from this model
         # score the samples x_0, stored as directory of sequences.
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        # Load the dataset based on training args
-        train_dset, _, test_dset = build_datasets(
-            # load_actual is only true if we want comparison done on a particular test set ! 
-            Path(self.from_ckpt_dir), load_actual=False,
-        )
-        phi_idx = test_dset.feature_names["angles"].index("phi")
-        psi_idx = test_dset.feature_names["angles"].index("psi")
-        # Fetch values for training distribution
-        select_by_attn = lambda x: x["angles"][x["attn_mask"] != 0]
-
-        # model is already loaded 
-        self = self.to(torch.device(device))
-
-
-        sweep_min_len, sweep_max_len = self.lengths
-        assert sweep_min_len < sweep_max_len
-        assert sweep_max_len <= train_dset.dset.pad
-
-        # maybe pick a random length to use each time???
-        length_to_use = np.random.choice(range(sweep_min_len, sweep_max_len))
-
-        # what is the train_dset?
-        # Perform sampling
-        sampled, log_probs = sampling.sample(
-            self,
-            train_dset,
-            n=self.num,
-            sweep_lengths=(length_to_use, length_to_use + 1),
-            batch_size=self.sampling_batch_size
-        )
-
-        final_sampled = [s[-1] for s in sampled]
-
-        rewards = self.reward_fn.compute_scTM_scores(final_sampled = final_sampled,
-                                                    feature_names = train_dset.feature_names["angles"], 
-                                                    device = torch.cuda.current_device())
-
-
-        #rewards = torch.tensor([np.random.normal(3, 5) for _ in final_sampled], device=device) # compute_scTM_scores(final_sampled)
-
-        sampled, rewards, log_probs
-
-        # First you gotta optimize the training loop
-        # And also make sure it learns!! AKA has gradients!!
-
-        samples_tensor = torch.nested.nested_tensor(sampled, dtype=torch.float32) # TODO: is this the right type
-        rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
-        log_probs_tensor = torch.nested.nested_tensor(log_probs, dtype=torch.float32)
+        
         
         # so, I need to 1) collect rewards by the redunancy I have?
         # Then average along that dimension
         # Create a dataset from the trajectory
-        dataset = TensorDataset(samples_tensor, rewards_tensor, log_probs_tensor)
-        
-        dataloader = DataLoader(
-            dataset=dataset,
-            batch_size=self.sampling_batch_size,
-            num_workers=20,
-            sampler=None,
-        )
+        curr_batch_count = 0
+        while True:
+            if curr_batch_count > self.epochs:
+                break
+            curr_batch_count += 1 
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
+            # Load the dataset based on training args
+            train_dset, _, test_dset = build_datasets(
+                # load_actual is only true if we want comparison done on a particular test set ! 
+                Path(self.from_ckpt_dir), load_actual=False,
+            )
+            phi_idx = test_dset.feature_names["angles"].index("phi")
+            psi_idx = test_dset.feature_names["angles"].index("psi")
+            # Fetch values for training distribution
+            select_by_attn = lambda x: x["angles"][x["attn_mask"] != 0]
+
+            # model is already loaded 
+            self = self.to(torch.device(device))
+
+
+            sweep_min_len, sweep_max_len = self.lengths
+            assert sweep_min_len < sweep_max_len
+            assert sweep_max_len <= train_dset.dset.pad
+
+            # maybe pick a random length to use each time???
+            length_to_use = np.random.choice(range(sweep_min_len, sweep_max_len))
+
+            # what is the train_dset?
+            # Perform sampling
+            sampled, log_probs = sampling.sample(
+                self,
+                train_dset,
+                n=self.num,
+                sweep_lengths=(length_to_use, length_to_use + 1),
+                batch_size=self.sampling_batch_size
+            )
+
+            final_sampled = [s[-1] for s in sampled]
+
+            rewards = self.reward_fn.compute_scTM_scores(final_sampled = final_sampled,
+                                                        feature_names = train_dset.feature_names["angles"], 
+                                                        device = torch.cuda.current_device())
+
+
+            #rewards = torch.tensor([np.random.normal(3, 5) for _ in final_sampled], device=device) # compute_scTM_scores(final_sampled)
+
+            sampled, rewards, log_probs
+
+            # First you gotta optimize the training loop
+            # And also make sure it learns!! AKA has gradients!!
+
+            samples_tensor = torch.nested.nested_tensor(sampled, dtype=torch.float32) # TODO: is this the right type
+            rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
+            log_probs_tensor = torch.nested.nested_tensor(log_probs, dtype=torch.float32)
+
+            yield samples_tensor, rewards_tensor, log_probs_tensor
+            
+
+    def _dataloader(self) -> DataLoader:
+        ## Creates a new set of trajectories? 
+        # TODO: Come back to https://github.com/Lightning-Universe/lightning-bolts/blob/0.5.0/pl_bolts/models/rl/reinforce_model.py#L26-L302
+        """Initialize the dataset used for getting trajectories"""
+        # need wrapper class for this. 
+        dataset = TrajectoryDataset(self.trajectory_batch)
+        dataloader = DataLoader(dataset=dataset, 
+                                batch_size=self.sampling_batch_size,
+                                num_workers=0,
+                                collate_fn = lambda batch: batch) # setting this differently spawns on CUDA!
         return dataloader
 
     def train_dataloader(self) -> DataLoader:
-        """Get train loader"""
-        return self.__dataloader()
+        """Get train loader."""
+        return self._dataloader()
+    
 
 
 class BertForAutoregressiveBase(BertForDiffusionBase):
