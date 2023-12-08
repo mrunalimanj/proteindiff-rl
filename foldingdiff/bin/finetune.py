@@ -226,13 +226,6 @@ def build_callbacks(
     os.makedirs(os.path.join(outdir, "models/best_by_train"), exist_ok=True)
     callbacks = [
         pl.callbacks.ModelCheckpoint(
-            monitor="val_loss",
-            dirpath=os.path.join(outdir, "models/best_by_valid"),
-            save_top_k=5,
-            save_weights_only=True,
-            mode="min",
-        ),
-        pl.callbacks.ModelCheckpoint(
             monitor="train_loss",
             dirpath=os.path.join(outdir, "models/best_by_train"),
             save_top_k=5,
@@ -241,6 +234,15 @@ def build_callbacks(
         ),
         pl.callbacks.LearningRateMonitor(logging_interval="epoch"),
     ]
+    """
+    pl.callbacks.ModelCheckpoint(
+        monitor="val_loss",
+        dirpath=os.path.join(outdir, "models/best_by_valid"),
+        save_top_k=5,
+        save_weights_only=True,
+        mode="min",
+    ),
+    """
     if early_stop_patience is not None and early_stop_patience > 0:
         logging.info(f"Using early stopping with patience {early_stop_patience}")
         callbacks.append(
@@ -311,7 +313,7 @@ def train_again(
     gradient_clip: float = 1.0,  # From BERT trainer
     batch_size: int = 64, 
     loss: modelling.LOSS_KEYS = "smooth_l1",
-    min_epochs: Optional[int] = 1,
+    min_epochs: Optional[int] = 4,
     max_epochs: int = 5,
     early_stop_patience: int = 0,  # Set to 0 to disable early stopping
     use_swa: bool = False,  # Stochastic weight averaging can improve training genearlization
@@ -498,7 +500,7 @@ def train_again(
     metrics_csv = os.path.join(
         trainer.logger.save_dir, "lightning_logs/version_0/metrics.csv"
     )
-    assert os.path.isfile(metrics_csv)
+    # assert os.path.isfile(metrics_csv)
     # Plot the losses
     plotting.plot_losses(
         metrics_csv, out_fname=plots_folder / "losses.pdf", simple=True

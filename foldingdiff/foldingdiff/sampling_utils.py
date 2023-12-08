@@ -228,7 +228,6 @@ def build_datasets(
         )
         return train_dset, valid_dset, test_dset
     else:
-        print('load_actual is None?')
         mean_file = model_dir / "training_mean_offset.npy"
         placeholder_dset = AnglesEmptyDataset(
             feature_set_key=training_args["angles_definitions"],
@@ -276,7 +275,6 @@ class RewardStructure():
         tm_score for each prediction. Returns the list of files written.
         """
         gen_pdb_outdir = self.config["gen_pdb_outdir"]
-        print(f"writing to {gen_pdb_outdir}")
         os.makedirs(gen_pdb_outdir, exist_ok=True)
         logging.info(
             f"Writing sampled angles as PDB files to {gen_pdb_outdir} using {threads} threads"
@@ -378,7 +376,7 @@ class RewardStructure():
         For each pdb file in the given list, generate sequences using ProteinMPNN and write them to a fasta file.
         Returns a list of the fasta files written.
         """
-        print(f"Running ProteinMPNN on {len(pdb_fnames)} PDB files")
+        # print(f"Running ProteinMPNN on {len(pdb_fnames)} PDB files")
         proteinmpnn_seqs_written = [] # TODO: wait this should be double indexed. oops. 
         for pdb_fname in tqdm(pdb_fnames):
             seqs = self.generate_residues_proteinmpnn(
@@ -470,7 +468,6 @@ class RewardStructure():
 
     def seqs_to_structures(self, list_of_fasta_files: List[str], device):
         gpus = self.config["omegafold_gpus"]
-        print("the length of gpus:", len(gpus))
         outdir = self.config["omegafold_outdir"]
         # outdir=os.path.abspath(os.path.join(os.getcwd(), self.config["omegafold_outdir"])),
         # TODO: could use output directory, figure out logic for saving + storing
@@ -540,7 +537,6 @@ class RewardStructure():
         assert os.path.isdir(predicted), f"Directory not found: {predicted}"
 
         # TODO: make sure this is right
-        print(f"folded: {folded}")
         # perhaps need to wait until all files are done computing. 
         orig_predicted_backbones = glob.glob(os.path.join(predicted, "*.pdb"))
         logging.info(
@@ -582,8 +578,6 @@ class RewardStructure():
             orig_predicted_backbone_names[i]: sctm_scores_raw_and_ref[i][1]
             for i in sctm_non_nan_idx
         }
-        print(sctm_scores_mapping) # this is some kind of dictionary,, 
-
         sctm_scores = np.array(list(sctm_scores_mapping.values()))
 
         passing_num = np.sum(sctm_scores >= 0.5)
@@ -621,5 +615,4 @@ class RewardStructure():
         orig_pdb_folder = self.config["gen_pdb_outdir"]
         new_pdbs_folder = self.config["omegafold_outdir"]
         rewards = self.score_structures(predicted = orig_pdb_folder, folded = new_pdbs_folder)
-        print(rewards)
         return rewards 

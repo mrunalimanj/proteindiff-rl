@@ -722,8 +722,6 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
             l1_penalty = sum(torch.linalg.norm(p, 1) for p in self.parameters())
             avg_loss += self.l1_lambda * l1_penalty
 
-        print(self.ft_names)
-
         pseudo_ft_names = (
             (self.ft_names + ["pairwise_dist_loss"])
             if self.use_pairwise_dist_loss
@@ -736,6 +734,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         }
         loss_dict["train_loss"] = avg_loss
         self.log_dict(loss_dict)  # Don't seem to need rank zero or sync dist
+        self.log_dict(log)
 
         return avg_loss
 
@@ -750,6 +749,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         # Increment counter and timers
         self.train_epoch_counter += 1
         self.train_epoch_last_time = time.time()
+        self.log('train_loss', mean_loss)
 
     def validation_step(self, batch, batch_idx) -> Dict[str, torch.Tensor]:
         """
@@ -918,7 +918,6 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
         log_probs_tensor = torch.nested.nested_tensor(log_probs, dtype=torch.float32)
         
-        print(len(sampled), rewards_tensor.shape, len(log_probs))
         # so, I need to 1) collect rewards by the redunancy I have?
         # Then average along that dimension
         # Create a dataset from the trajectory
@@ -927,6 +926,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         dataloader = DataLoader(
             dataset=dataset,
             batch_size=self.sampling_batch_size,
+            num_workers=20,
             sampler=None,
         )
         return dataloader
