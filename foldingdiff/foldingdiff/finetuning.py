@@ -700,20 +700,22 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         https://github.com/Lightning-Universe/lightning-bolts/blob/0.5.0/pl_bolts/models/rl/reinforce_model.py#L26-L302
         """
         loss_terms = self.loss(batch) # mean here, instead of in self.loss
+        if isinstance(loss_terms, list):
+            loss_terms = torch.stack(loss_terms)
         avg_loss = torch.mean(loss_terms)
 
         # TODO: what do I want to log: 
         # - the average reward across trajectories
         # - the average loss across trajectories
 
-        samples, rewards, log_probs = batch
+        # samples, rewards, log_probs = batch
         # loss_terms = self._get_loss_terms(batch)
         avg_loss = torch.mean(loss_terms)
 
         log = {
             # "episodes": self.done_episodes,
             "avg_loss": avg_loss,
-            "avg_reward": rewards.mean(),
+            # "avg_reward": rewards.mean(),
         }
 
 
@@ -727,6 +729,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
             if self.use_pairwise_dist_loss
             else self.ft_names
         )
+        loss_terms = torch.squeeze(loss_terms)
         assert len(loss_terms) == len(pseudo_ft_names)
         loss_dict = {
             f"train_loss_{val_name}": val
@@ -837,11 +840,12 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         pl.utilities.rank_zero_info(f"Using optimizer {retval}")
         return retval
     
-    def set_rl_train_config(self, from_ckpt_dir, lengths, num, sampling_batch_size):
+    def set_rl_train_config(self, from_ckpt_dir, lengths, num, sampling_batch_size, train_batch_size):
         self.from_ckpt_dir = from_ckpt_dir
         self.lengths = lengths
         self.num = num
         self.sampling_batch_size = sampling_batch_size
+        self.train_batch_size = train_batch_size
 
 
     def set_reward_config(self, 
@@ -856,6 +860,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
             "omegafold_gpus": omegafold_gpus,
             "omegafold_outdir": omegafold_outdir,
             "sctm_score_file": sctm_score_file,
+            
 
         }
         self.reward_fn = RewardStructure(self.reward_config)
@@ -871,7 +876,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         # Create a dataset from the trajectory
         curr_batch_count = 0
         while True:
-            if curr_batch_count > self.epochs:
+            if curr_batch_count > self.train_batch_size:
                 break
             curr_batch_count += 1 
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -935,7 +940,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         # need wrapper class for this. 
         dataset = TrajectoryDataset(self.trajectory_batch)
         dataloader = DataLoader(dataset=dataset, 
-                                batch_size=self.sampling_batch_size,
+                                batch_size=self.train_batch_size,
                                 num_workers=0,
                                 collate_fn = lambda batch: batch) # setting this differently spawns on CUDA!
         return dataloader

@@ -320,7 +320,7 @@ def train_again(
     ## related to learning method
     method: str = "reinforce", # TODO: where is the seed set?
     lengths: Tuple[int, int] = (100, 128), 
-    sampling_num: int = 3,
+    sampling_num: int = 1,
     sampling_batch_size: int = 512, 
 
     ## related to reward function
@@ -468,7 +468,7 @@ def train_again(
         gradient_clip_val=gradient_clip,
         min_epochs=min_epochs,
         max_epochs=max_epochs,
-        check_val_every_n_epoch=1,
+        #check_val_every_n_epoch=1,
         callbacks=callbacks,
         logger=pl.loggers.CSVLogger(save_dir=new_results_folder / "logs"),
         log_every_n_steps=32, # min(200, len(train_dataloader)),  # Log >= once per epoch
@@ -486,7 +486,7 @@ def train_again(
 
     
     # <----------------------------------  model TRAINING  ----------------------------------> 
-    model.set_rl_train_config(from_ckpt_dir, lengths, sampling_num, sampling_batch_size)
+    model.set_rl_train_config(from_ckpt_dir, lengths, sampling_num, sampling_batch_size, train_batch_size = 1, )
     model.set_reward_config(new_results_dir, gen_pdb_outdir, mpnn_replicates, mpnn_outdir,
             omegafold_gpus, omegafold_outdir, sctm_score_file)
     trainer.fit(

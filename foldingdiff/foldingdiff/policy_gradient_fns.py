@@ -2,12 +2,29 @@ import torch
 
 def reinforce(batch):
     """REINFORCE algorithm"""
-    samples, rewards, log_probs = batch
-    policy_loss = []
-    # print("back log probs", log_probs[0][-1]) # this is the one to diagnose... 
-    overall_log_probs = torch.stack([log_prob.nansum(dim=tuple(range(log_prob.ndim - 1))) for log_prob in log_probs]).requires_grad_()
-    loss = -overall_log_probs * rewards[:, None]
-    return loss.transpose(0, 1) # TODO: hopefully this remains 2-dimensional?
+    print("batch size", len(batch))
+    print("is there a first example? what is it's shape?", len(batch[0]))
+    if len(batch) != 3:
+        batch_list = batch
+        policy_loss = []
+        for batch in batch_list:
+            samples, rewards, log_probs = batch
+            policy_loss = []
+            # print("back log probs", log_probs[0][-1]) # this is the one to diagnose... 
+            print("log_probs", log_probs) # these log_probabilities aren't gettign computed correctly :(
+            overall_log_probs = torch.stack([log_prob.nansum(dim=tuple(range(log_prob.ndim - 1))) for log_prob in log_probs]).requires_grad_()
+            loss = -overall_log_probs * rewards[:, None]
+            policy_loss.append(loss.transpose(0, 1))
+            
+        return policy_loss # TODO: hopefully this remains 2-dimensional?
+    else: 
+        samples, rewards, log_probs = batch
+        policy_loss = []
+        # print("back log probs", log_probs[0][-1]) # this is the one to diagnose... 
+        overall_log_probs = torch.stack([log_prob.nansum(dim=tuple(range(log_prob.ndim - 1))) for log_prob in log_probs]).requires_grad_()
+        loss = -overall_log_probs * rewards[:, None]
+        return loss.transpose(0, 1)
+
 
 
 def vanilla_pg(batch):
