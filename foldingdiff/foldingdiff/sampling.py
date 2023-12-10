@@ -70,33 +70,32 @@ def p_sample(
     )
 
     if t_index == 0:
-        # TODO: what should this be?
-        # This is the final sampling step... make sure this is right!
-        posterior_variance_t = alpha_beta_values["posterior_variance"][t_index]
-        log_prob = (
-            -((x.detach() - model_mean) ** 2) / (2 * (posterior_variance_t))
-            - torch.log(torch.sqrt(posterior_variance_t))
-            - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
-        )
+        x_0 = model_mean
+        # posterior_variance_t = alpha_beta_values["posterior_variance"][t_index]
         # mean along all but batch dimension # TODO: what is the batch dimension here?
-        # log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
-    
-        return model_mean, log_prob
+        # log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim))
+        return model_mean, torch.zeros_like(model_mean)
     else:
         posterior_variance_t = alpha_beta_values["posterior_variance"][t_index]
+        noise = torch.randn_like(x)
+        # could just get probability from here lol.  
+        x_t_minus_1 = model_mean + torch.sqrt(posterior_variance_t) * noise
         # print out my prob!
         # log prob of prev_sample given prev_sample_mean and std_dev_t
         log_prob = (
-            -((x.detach() - model_mean) ** 2) / (2 * (posterior_variance_t))
+            -((x_t_minus_1.detach() - model_mean) ** 2) / (2 * (posterior_variance_t))
             - torch.log(torch.sqrt(posterior_variance_t))
             - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
         )
+        # flatten any positive values to 0
+        
+        log_prob = torch.where(log_prob > 0, torch.zeros_like(log_prob), log_prob)
         # mean along all but batch dimension # TODO: what is the batch dimension here?
         # log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
-    
-        noise = torch.randn_like(x) 
-        # Algorithm 2 line 4:
-        return model_mean + torch.sqrt(posterior_variance_t) * noise, log_prob
+        
+        assert (log_prob <= 0).all().item(), f"log_probabilities should be negative but instead were {log_prob}"
+        # print(f"log probs all neg at time step {t_index}")
+        return x_t_minus_1, log_prob
 
 
 @torch.no_grad()
@@ -147,6 +146,7 @@ def p_sample_loop(
                     img, range_min=-torch.pi, range_max=torch.pi
                 )
             # consider wrapping probability? 
+            # wrapped pdf is not tractable... oops. 
         else:
             assert len(is_angle) == img.shape[-1]
             for j in range(img.shape[-1]):
@@ -207,6 +207,7 @@ def sample(
     for this_lengths in lengths_chunkified:
         batch = len(this_lengths)
         # Sample noise and sample the lengths
+        # This is sampling noise, so here is where we can get out the probability of that original noise! 
         noise = train_dset.sample_noise(
             torch.zeros((batch, train_dset.pad, model.n_inputs), dtype=torch.float32)
         )
@@ -214,7 +215,8 @@ def sample(
         # Trim things that are beyond the length of what we are generating
         if trim_to_length:
             noise = noise[:, : max(this_lengths), :]
-
+            
+        std_log_prob = - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi))) - 0.5 * noise ** 2
         # Produces (timesteps, batch_size, seq_len, n_ft)
         sampled, probs = p_sample_loop(
             model=model,
@@ -225,6 +227,8 @@ def sample(
             is_angle=train_dset.feature_is_angular[feature_key],
             disable_pbar=disable_pbar,
         )
+        # add x_T probs to front, drop the 0 probs from last step 
+        probs = torch.cat([std_log_prob[None, :, :, :], probs])[:1000, :, :, :]
         # Gets to size (timesteps, seq_len, n_ft)
         trimmed_sampled = [
             sampled[:, i, :l, :].numpy() for i, l in enumerate(this_lengths)

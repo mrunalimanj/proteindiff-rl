@@ -703,6 +703,9 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         if isinstance(loss_terms, list):
             loss_terms = torch.stack(loss_terms)
         avg_loss = torch.mean(loss_terms)
+        # really make sure it's a scalar!
+        avg_loss = torch.mean(avg_loss)
+        
 
         # TODO: what do I want to log: 
         # - the average reward across trajectories
@@ -710,7 +713,6 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
 
         # samples, rewards, log_probs = batch
         # loss_terms = self._get_loss_terms(batch)
-        avg_loss = torch.mean(loss_terms)
 
         log = {
             # "episodes": self.done_episodes,
@@ -745,6 +747,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         """Log the average training loss over the epoch"""
         losses = torch.stack([o["loss"] for o in outputs])
         mean_loss = torch.mean(losses)
+        mean_loss = torch.mean(mean_loss)
         t_delta = time.time() - self.train_epoch_last_time
         pl.utilities.rank_zero_info(
             f"Train loss at epoch {self.train_epoch_counter} end: {mean_loss:.4f} ({t_delta:.2f} seconds)"
@@ -864,6 +867,17 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
 
         }
         self.reward_fn = RewardStructure(self.reward_config)
+
+        # Load the dataset based on training args
+        self.train_dset, _, self.test_dset = build_datasets(
+            # load_actual is only true if we want comparison done on a particular test set ! 
+            Path(self.from_ckpt_dir), load_actual=False,
+        )
+        phi_idx = self.test_dset.feature_names["angles"].index("phi")
+        psi_idx = self.test_dset.feature_names["angles"].index("psi")
+        # Fetch values for training distribution
+        select_by_attn = lambda x: x["angles"][x["attn_mask"] != 0]
+
     
     def trajectory_batch(self):
         # samples
@@ -881,23 +895,13 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
             curr_batch_count += 1 
             device = "cuda" if torch.cuda.is_available() else "cpu"
 
-            # Load the dataset based on training args
-            train_dset, _, test_dset = build_datasets(
-                # load_actual is only true if we want comparison done on a particular test set ! 
-                Path(self.from_ckpt_dir), load_actual=False,
-            )
-            phi_idx = test_dset.feature_names["angles"].index("phi")
-            psi_idx = test_dset.feature_names["angles"].index("psi")
-            # Fetch values for training distribution
-            select_by_attn = lambda x: x["angles"][x["attn_mask"] != 0]
-
             # model is already loaded 
             self = self.to(torch.device(device))
 
 
             sweep_min_len, sweep_max_len = self.lengths
             assert sweep_min_len < sweep_max_len
-            assert sweep_max_len <= train_dset.dset.pad
+            assert sweep_max_len <= self.train_dset.dset.pad
 
             # maybe pick a random length to use each time???
             length_to_use = np.random.choice(range(sweep_min_len, sweep_max_len))
@@ -906,7 +910,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
             # Perform sampling
             sampled, log_probs = sampling.sample(
                 self,
-                train_dset,
+                self.train_dset,
                 n=self.num,
                 sweep_lengths=(length_to_use, length_to_use + 1),
                 batch_size=self.sampling_batch_size
@@ -915,7 +919,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
             final_sampled = [s[-1] for s in sampled]
 
             rewards = self.reward_fn.compute_scTM_scores(final_sampled = final_sampled,
-                                                        feature_names = train_dset.feature_names["angles"], 
+                                                        feature_names = self.train_dset.feature_names["angles"], 
                                                         device = torch.cuda.current_device())
 
 

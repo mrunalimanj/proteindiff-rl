@@ -320,7 +320,7 @@ def train_again(
     ## related to learning method
     method: str = "reinforce", # TODO: where is the seed set?
     lengths: Tuple[int, int] = (100, 128), 
-    sampling_num: int = 1,
+    sampling_num: int = 4,
     sampling_batch_size: int = 512, 
 
     ## related to reward function
@@ -486,7 +486,7 @@ def train_again(
 
     
     # <----------------------------------  model TRAINING  ----------------------------------> 
-    model.set_rl_train_config(from_ckpt_dir, lengths, sampling_num, sampling_batch_size, train_batch_size = 1, )
+    model.set_rl_train_config(from_ckpt_dir, lengths, sampling_num, sampling_batch_size, train_batch_size = 6, )
     model.set_reward_config(new_results_dir, gen_pdb_outdir, mpnn_replicates, mpnn_outdir,
             omegafold_gpus, omegafold_outdir, sctm_score_file)
     trainer.fit(
@@ -543,7 +543,7 @@ def train_old(
     l2_norm: float = 0.0,  # AdamW default has 0.01 L2 regularization, but BERT trainer uses 0.0
     l1_norm: float = 0.0,
     circle_reg: float = 0.0,
-    min_epochs: Optional[int] = 1,
+    min_epochs: Optional[int] = 2,
     max_epochs: int = 5,
     early_stop_patience: int = 0,  # Set to 0 to disable early stopping
     lr_scheduler: modelling.LR_SCHEDULE = None,

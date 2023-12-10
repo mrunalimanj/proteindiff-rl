@@ -3,3 +3,5 @@ foldingdiff/.gitmodules
 foldingdiff/.ipynb_checkpoints/
 foldingdiff/plots/
 model_runs/
+model_reward_debug/
+results_*/
