@@ -19,7 +19,13 @@ from typing import *
 import numpy as np
 from tqdm.auto import tqdm
 import re
+import math
 
+from tqdm.auto import tqdm
+from torch import nn
+
+from foldingdiff import datasets as dsets
+from foldingdiff import beta_schedules, utils, tmalign
 
 from huggingface_hub import snapshot_download
 
@@ -62,7 +68,6 @@ from scipy import stats
 from biotite import structure as struc
 from biotite.structure.io.pdb import PDBFile
 
-from annot_secondary_structures import count_structures_in_pdb
 
 from foldingdiff import tmalign
 from foldingdiff.angles_and_coords import get_pdb_length
@@ -267,6 +272,238 @@ def build_datasets(
             for _ in range(3)
         ]
         return noised_dsets
+    
+# <------------------------- Sampling methods ------------------------------------->
+
+# Needs to sample according probabilities as well. 
+# @torch.no_grad()
+def p_sample(
+    model: nn.Module,
+    x: torch.Tensor,
+    t: torch.Tensor,
+    seq_lens: Sequence[int],
+    t_index: torch.Tensor,
+    betas: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Sample the given timestep. Note that this _may_ fall off the manifold if we just
+    feed the output back into itself repeatedly, so we need to perform modulo on it
+    (see p_sample_loop)
+    """
+    # Calculate alphas and betas
+    alpha_beta_values = beta_schedules.compute_alphas(betas)
+    sqrt_recip_alphas = 1.0 / torch.sqrt(alpha_beta_values["alphas"])
+
+    # Select based on time
+    t_unique = torch.unique(t)
+    assert len(t_unique) == 1, f"Got multiple values for t: {t_unique}"
+    t_index = t_unique.item()
+    sqrt_recip_alphas_t = sqrt_recip_alphas[t_index]
+    betas_t = betas[t_index]
+    sqrt_one_minus_alphas_cumprod_t = alpha_beta_values[
+        "sqrt_one_minus_alphas_cumprod"
+    ][t_index]
+
+    # Create the attention mask
+    attn_mask = torch.zeros(x.shape[:2], device=x.device)
+    for i, length in enumerate(seq_lens):
+        attn_mask[i, :length] = 1.0
+
+    # Equation 11 in the paper
+    # Use our model (noise predictor) to predict the mean
+    model_mean = sqrt_recip_alphas_t * (
+        x
+        - betas_t
+        * model(x, t, attention_mask=attn_mask)
+        / sqrt_one_minus_alphas_cumprod_t
+    )
+
+    if t_index == 0:
+        x_0 = model_mean
+        # posterior_variance_t = alpha_beta_values["posterior_variance"][t_index]
+        # mean along all but batch dimension # TODO: what is the batch dimension here?
+        # log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim))
+        return model_mean, torch.zeros_like(model_mean)
+    else:
+        posterior_variance_t = alpha_beta_values["posterior_variance"][t_index]
+        noise = torch.randn_like(x)
+        # could just get probability from here lol.  
+        x_t_minus_1 = model_mean + torch.sqrt(posterior_variance_t) * noise
+        # print out my prob!
+        # log prob of prev_sample given prev_sample_mean and std_dev_t
+        log_prob = (
+            -((x_t_minus_1.detach() - model_mean) ** 2) / (2 * (posterior_variance_t))
+            - torch.log(torch.sqrt(posterior_variance_t))
+            - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
+        )
+        # mean along all but batch dimension # TODO: what is the batch dimension here?
+        # log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
+        
+        # print(f"log probs all neg at time step {t_index}")
+        return x_t_minus_1, log_prob
+
+
+# @torch.no_grad()
+def p_sample_loop(
+    model: nn.Module,
+    lengths: Sequence[int],
+    noise: torch.Tensor,
+    timesteps: int,
+    betas: torch.Tensor,
+    is_angle: Union[bool, List[bool]] = [False, True, True, True],
+    disable_pbar: bool = False,
+) -> torch.Tensor:
+    """
+    Returns a tensor of shape (timesteps, batch_size, seq_len, n_ft)
+    """
+    device = next(model.parameters()).device
+    b = noise.shape[0]
+    img = noise.to(device)
+    # Report metrics on starting noise
+    # amin and amax support reducing on multiple dimensions
+    logging.info(
+        f"Starting from noise {noise.shape} with angularity {is_angle} and range {torch.amin(img, dim=(0, 1))} - {torch.amax(img, dim=(0, 1))} using {device}"
+    )
+
+    imgs = []
+    probs = []
+
+    for i in tqdm(
+        reversed(range(0, timesteps)),
+        desc="sampling loop time step",
+        total=timesteps,
+        disable=disable_pbar,
+    ):
+        # Shape is (batch, seq_len, 4)
+        img, prob_t = p_sample(
+            model=model,
+            x=img,
+            t=torch.full((b,), i, device=device, dtype=torch.long),  # time vector
+            seq_lens=lengths,
+            t_index=i,
+            betas=betas,
+        )
+        
+        # Wrap if angular
+        if isinstance(is_angle, bool):
+            if is_angle:
+                img = utils.modulo_with_wrapped_range(
+                    img, range_min=-torch.pi, range_max=torch.pi
+                )
+            # consider wrapping probability? 
+            # wrapped pdf is not tractable... oops. 
+        else:
+            assert len(is_angle) == img.shape[-1]
+            for j in range(img.shape[-1]):
+                if is_angle[j]:
+                    img[:, :, j] = utils.modulo_with_wrapped_range(
+                        img[:, :, j], range_min=-torch.pi, range_max=torch.pi
+                    )
+        imgs.append(img.cpu())
+        probs.append(prob_t.cpu())
+    return torch.stack(imgs), torch.stack(probs)
+
+
+def sample(
+    model: nn.Module,
+    train_dset: dsets.NoisedAnglesDataset,
+    n: int = 10,
+    sweep_lengths: Optional[Tuple[int, int]] = (50, 128),
+    batch_size: int = 512,
+    feature_key: str = "angles",
+    disable_pbar: bool = False,
+    trim_to_length: bool = True,  # Trim padding regions to reduce memory
+) -> List[np.ndarray]:
+    """
+    Sample from the given model. Use the train_dset to generate noise to sample
+    sequence lengths. Returns a list of arrays, shape (timesteps, seq_len, fts).
+    If sweep_lengths is set, we generate n items per length in the sweep range
+
+    train_dset object must support:
+    - sample_noise - provided by NoisedAnglesDataset
+    - timesteps - provided by NoisedAnglesDataset
+    - alpha_beta_terms - provided by NoisedAnglesDataset
+    - feature_is_angular - provided by *wrapped dataset* under NoisedAnglesDataset
+    - pad - provided by *wrapped dataset* under NoisedAnglesDataset
+    And optionally, sample_length()
+    """
+    # Process each batch
+    if sweep_lengths is not None:
+        sweep_min, sweep_max = sweep_lengths
+        if not sweep_min < sweep_max:
+            raise ValueError(
+                f"Minimum length {sweep_min} must be less than maximum {sweep_max}"
+            )
+        logging.info(
+            f"Sweeping from {sweep_min}-{sweep_max} with {n} examples at each length"
+        )
+        lengths = []
+        for l in range(sweep_min, sweep_max):
+            lengths.extend([l] * n)
+    else:
+        lengths = [train_dset.sample_length() for _ in range(n)]
+    lengths_chunkified = [
+        lengths[i : i + batch_size] for i in range(0, len(lengths), batch_size)
+    ]
+
+    logging.info(f"Sampling {len(lengths)} items in batches of size {batch_size}")
+    retval = []
+    prob_retval = [] 
+    for this_lengths in lengths_chunkified:
+        batch = len(this_lengths)
+        # Sample noise and sample the lengths
+        # This is sampling noise, so here is where we can get out the probability of that original noise! 
+        noise = train_dset.sample_noise(
+            torch.zeros((batch, train_dset.pad, model.n_inputs), dtype=torch.float32)
+        )
+
+        # Trim things that are beyond the length of what we are generating
+        if trim_to_length:
+            noise = noise[:, : max(this_lengths), :]
+            
+        std_log_prob = - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi))) - 0.5 * noise ** 2
+        # Produces (timesteps, batch_size, seq_len, n_ft)
+        sampled, probs = p_sample_loop(
+            model=model,
+            lengths=this_lengths,
+            noise=noise,
+            timesteps=train_dset.timesteps,
+            betas=train_dset.alpha_beta_terms["betas"],
+            is_angle=train_dset.feature_is_angular[feature_key],
+            disable_pbar=disable_pbar,
+        )
+        # add x_T probs to front, drop the 0 probs from last step 
+        probs = torch.cat([std_log_prob[None, :, :, :], probs])[:1000, :, :, :]
+        # Gets to size (timesteps, seq_len, n_ft)
+        trimmed_sampled = [
+            sampled[:, i, :l, :].numpy() for i, l in enumerate(this_lengths)
+        ]
+        retval.extend(trimmed_sampled)
+        probs_trimmed_sampled = [
+            probs[:, i, :l, :].numpy() for i, l in enumerate(this_lengths)
+        ]
+        prob_retval.extend(probs_trimmed_sampled)
+    # Note that we don't use means variable here directly because we may need a subset
+    # of it based on which features are active in the dataset. The function
+    # get_masked_means handles this gracefully
+    if (
+        hasattr(train_dset, "dset")
+        and hasattr(train_dset.dset, "get_masked_means")
+        and train_dset.dset.get_masked_means() is not None
+    ):
+        logging.info(
+            f"Shifting predicted values by original offset: {train_dset.dset.get_masked_means()}"
+        )
+        retval = [s + train_dset.dset.get_masked_means() for s in retval]
+        # Because shifting may have caused us to go across the circle boundary, re-wrap
+        angular_idx = np.where(train_dset.feature_is_angular[feature_key])[0]
+        for s in retval:
+            s[..., angular_idx] = utils.modulo_with_wrapped_range(
+                s[..., angular_idx], range_min=-np.pi, range_max=np.pi
+            )
+
+    return retval, prob_retval
+
 
 # <------------------------- reward computation functions; modified from bin/ scripts ------------------------------------->
 
@@ -583,14 +820,6 @@ class RewardStructure():
         orig_predicted_backbone_names = [
             os.path.splitext(os.path.basename(f))[0] for f in orig_predicted_backbones
         ]
-        with mp.Pool(mp.cpu_count()) as pool:
-            ss_counts = list(
-                pool.map(count_structures_in_pdb, orig_predicted_backbones, chunksize=10)
-            )
-            orig_predicted_secondary_structs = {
-                os.path.splitext(os.path.basename(f))[0]: s
-                for f, s in zip(orig_predicted_backbones, ss_counts)
-            }
 
         # Match up the files
         pfunc = functools.partial(self.get_all_sctm_scores, folded_dirname=Path(folded))
@@ -602,7 +831,7 @@ class RewardStructure():
         pool.join()
         print(sctm_scores_raw_and_ref)
         sctm_non_nan_idx = [
-            i for i, (val, _) in enumerate(sctm_scores_raw_and_ref) if ~np.isnan(val)
+            i for i, val in enumerate(sctm_scores_raw_and_ref) if ~(np.isnan(val)).all()
         ]
         full_sctm_scores_mapping = {
             orig_predicted_backbone_names[i]: sctm_scores_raw_and_ref[i]
@@ -617,7 +846,7 @@ class RewardStructure():
         scores_all_df.to_csv(sctm_file, index = False)
         
         
-        sctm_scores_mapping = {backbone: max(scores) for backbone, scores in full_sctm_scores_mapping.items()}
+        sctm_scores_mapping = {backbone: np.nanmax(scores) for backbone, scores in full_sctm_scores_mapping.items()}
         sctm_scores = np.array(list(sctm_scores_mapping.values()))
 
         passing_num = np.sum(sctm_scores >= 0.5)
@@ -647,6 +876,12 @@ class RewardStructure():
 
     def compute_scTM_scores(self, final_sampled, feature_names, device):
         self.config["abs_step"] += 1
+        # clear temp before proceeding
+        for subpath in ["gen_pdb_outdir", "mpnn_outdir", "omegafold_outdir"]:
+            files = glob.glob(os.path.join(self.config[subpath], "*"))
+            for f in files:
+                os.remove(f)
+
         pdbs_written = self.write_preds_pdb_folder(final_sampled, feature_names = feature_names, device=device)
         mpnns_written = self.pdbs_to_seqs(pdbs_written, device=device)
         # above is debugged 
@@ -656,4 +891,5 @@ class RewardStructure():
         new_pdbs_folder = self.config["omegafold_outdir"]
         rewards = self.score_structures(predicted = orig_pdb_folder, folded = new_pdbs_folder,
                                         step = self.config["abs_step"])
+        assert len(final_sampled) == len(rewards)
         return rewards 

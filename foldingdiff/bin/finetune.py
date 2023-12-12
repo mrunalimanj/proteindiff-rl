@@ -310,6 +310,7 @@ def train_again(
     variance_schedule: beta_schedules.SCHEDULES = "linear",  # cosine better on single angle toy test
     variance_scale: float = 1.0,
     # Related to training strategy
+    lora: bool = False,
     gradient_clip: float = 1.0,  # From BERT trainer
     batch_size: int = 64, 
     loss: modelling.LOSS_KEYS = "smooth_l1",
@@ -319,7 +320,7 @@ def train_again(
     use_swa: bool = False,  # Stochastic weight averaging can improve training genearlization
     ## related to learning method
     method: str = "reinforce", # TODO: where is the seed set?
-    lengths: Tuple[int, int] = (100, 200), 
+    lengths: Tuple[int, int] = (100, 128), 
     sampling_num: int = 4,
     sampling_batch_size: int = 512, 
 
@@ -442,6 +443,16 @@ def train_again(
     model = finetuning.BertForDiffusion.from_dir(from_ckpt_dir, copy_to=new_results_dir)
     model.method = method
     loss_fn = loss
+
+    if lora:
+        from peft import get_peft_config, get_peft_model, get_peft_model_state_dict, LoraConfig, TaskType
+        peft_config = LoraConfig(task_type=TaskType.SEQ_2_SEQ_LM, inference_mode=False, r=8, lora_alpha=32, lora_dropout=0.1)
+        peft_model = get_peft_model(model, peft_config)
+        logging.info(f"using PEFT")
+        peft_model.print_trainable_parameters()
+        # wrap this model in a BertForDiffusionType.
+        model = finetuning.BertForDiffusionLoRA(peft_model, config= model.config)
+
     if single_angle_debug > 0 or single_timestep_debug or syn_noiser:
         loss_fn = functools.partial(losses.radian_smooth_l1_loss, beta=0.1 * np.pi)
     logging.info(f"Using loss function: {loss_fn}")
@@ -492,6 +503,7 @@ def train_again(
                               inner_loop = 3 if "reinforce" not in method else 0,)
     model.set_reward_config(new_results_dir, gen_pdb_outdir, mpnn_replicates, mpnn_outdir,
             omegafold_gpus, omegafold_outdir, sctm_score_file)
+    
     trainer.fit(
         model=model,
         # train_dataloaders=new_train_dataloader,
@@ -778,6 +790,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Debug single angle and timestep",
     )
+    
+    parser.add_argument(
+        "--lora",
+        action="store_true",
+        help="Use low-rank approximation?",
+    )
+
+
     parser.add_argument("--cpu", action="store_true", help="Force use CPU")
     parser.add_argument(
         "--ngpu", type=int, default=-1, help="Number of GPUs to use (-1 for all)"
@@ -806,6 +826,7 @@ def main():
             "ngpu": args.ngpu,
             "dryrun": args.dryrun,
             "method": args.rl_method,
+            "lora": args.lora,
         },
     )
     train_again(**config_args)

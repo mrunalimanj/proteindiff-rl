@@ -38,6 +38,7 @@ from foldingdiff.datasets import FEATURE_SET_NAMES_TO_ANGULARITY
 from foldingdiff.policy_gradient_fns import *
 from foldingdiff.sampling_utils import * 
 from foldingdiff import sampling
+from foldingdiff.sampling_utils import sample as new_sample
 
 LR_SCHEDULE = Optional[Literal["OneCycleLR", "LinearWarmup"]]
 TIME_ENCODING = Literal["gaussian_fourier", "sinusoidal"]
@@ -254,6 +255,7 @@ class BertForDiffusionBase(BertPreTrainedModel):
         """
         super().__init__(config)
         self.config = config
+        self.is_peft = False
         if self.config.is_decoder:
             raise NotImplementedError
         self.ft_is_angular = ft_is_angular
@@ -385,7 +387,7 @@ class BertForDiffusionBase(BertPreTrainedModel):
                 shutil.copyfile(ckpt_name, ckpt_dir / os.path.basename(ckpt_name))
 
         return retval
-
+    
     def forward(
         self,
         inputs: torch.Tensor,
@@ -556,7 +558,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         self.write_preds_counter = 0
         if self.write_preds_to_dir:
             os.makedirs(self.write_preds_to_dir, exist_ok=True)
-
+    
     def _get_loss_terms(
         self, batch, write_preds: Optional[str] = None
     ) -> List[torch.Tensor]:
@@ -913,7 +915,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
 
             # what is the train_dset?
             # Perform sampling
-            sampled, log_probs = sampling.sample(
+            sampled, log_probs = sampling.sample( # new_sample(
                 self,
                 self.train_dset,
                 n=self.num,
@@ -975,6 +977,500 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         """Get train loader."""
         return self._dataloader()
     
+
+class BertForDiffusionLoRA(BertForDiffusionBase, pl.LightningModule):
+    """
+    Wraps our model as a pl LightningModule for easy training
+    """
+
+    def __init__(
+        self,
+        model,
+        lr: float = 5e-5,
+        loss: Union[Callable, LOSS_KEYS] = "smooth_l1",
+        use_pairwise_dist_loss: Union[float, Tuple[float, float, int]] = 0.0,
+        l2: float = 0.0,
+        l1: float = 0.0,
+        circle_reg: float = 0.0,
+        epochs: int = 1,
+        method: str = "reinforce",
+        steps_per_epoch: int = 250,  # Dummy value
+        lr_scheduler: LR_SCHEDULE = None,
+        write_preds_to_dir: Optional[str] = None,
+        **kwargs,
+    ):
+        """Feed args to BertForDiffusionBase and then feed the rest into"""
+        BertForDiffusionBase.__init__(self, **kwargs)
+        # Store information about leraning rates and loss
+        self.learning_rate = lr
+        self.method = method
+        self.is_peft = True
+        # loss function is either a callable or a list of callables
+        if isinstance(loss, str):
+            logging.info(
+                f"Mapping loss {loss} to list of losses corresponding to angular {self.ft_is_angular}"
+            )
+            if loss in self.loss_autocorrect_dict:
+                logging.info(
+                    "Autocorrecting {} to {}".format(
+                        loss, self.loss_autocorrect_dict[loss]
+                    )
+                )
+                loss = self.loss_autocorrect_dict[loss]
+            self.loss_func = [
+                self.angular_loss_fn_dict[loss]
+                if is_angular
+                else self.nonangular_loss_fn_dict[loss]
+                for is_angular in self.ft_is_angular
+            ]
+        else:
+            logging.warning(
+                f"Using pre-given callable loss: {loss}. This may not handle angles correctly!"
+            )
+            self.loss_func = loss
+        pl.utilities.rank_zero_info(f"Using loss: {self.loss_func}")
+        if isinstance(self.loss_func, (tuple, list)):
+            assert (
+                len(self.loss_func) == self.n_inputs
+            ), f"Got {len(self.loss_func)} loss functions, expected {self.n_inputs}"
+
+        self.use_pairwise_dist_loss = use_pairwise_dist_loss
+        self.l1_lambda = l1
+        self.l2_lambda = l2
+        self.circle_lambda = circle_reg
+        self.epochs = epochs
+        self.steps_per_epoch = steps_per_epoch
+        self.lr_scheduler = lr_scheduler
+
+        # Set up the output directory for writing predictions
+        self.write_preds_to_dir = write_preds_to_dir
+        self.write_preds_counter = 0
+        if self.write_preds_to_dir:
+            os.makedirs(self.write_preds_to_dir, exist_ok=True)
+    
+    def _get_loss_terms(
+        self, batch, write_preds: Optional[str] = None
+    ) -> List[torch.Tensor]:
+        """
+        Returns the loss terms for the model. Length of the returned list
+        is equivalent to the number of features we are fitting to.
+        """
+        known_noise = batch["known_noise"]
+        
+        predicted_noise = self.forward(
+            batch["corrupted"],
+            batch["t"], # for a given timestep? OR! for a set number of timesteps? 
+            attention_mask=batch["attn_mask"],
+            position_ids=batch["position_ids"],
+        )
+        
+        assert (
+            known_noise.shape == predicted_noise.shape
+        ), f"{known_noise.shape} != {predicted_noise.shape}"
+
+        # Indexes into batch then indices along sequence length
+        # attn_mask has shape (batch, seq_len) --> where gives back
+        # two lists of values, one for each dimension
+        # known_noise has shape (batch, seq_len, num_fts)
+        unmask_idx = torch.where(batch["attn_mask"])
+        assert len(unmask_idx) == 2
+        loss_terms = []
+        for i in range(known_noise.shape[-1]):
+            loss_fn = (
+                self.loss_func[i]
+                if isinstance(self.loss_func, list)
+                else self.loss_func
+            )
+            logging.debug(f"Using loss function {loss_fn}")
+            # Determine whether the loss accepts circle_penalty
+            # https://stackoverflow.com/questions/23228664/how-to-check-which-arguments-a-function-method-takes
+            loss_args = inspect.getfullargspec(loss_fn)
+            if (
+                "circle_penalty" in loss_args.args
+                or "circle_penalty" in loss_args.kwonlyargs
+            ):
+                logging.debug(f"Loss function {loss_fn} accepts circle_penalty")
+                l = loss_fn(
+                    predicted_noise[unmask_idx[0], unmask_idx[1], i],
+                    known_noise[unmask_idx[0], unmask_idx[1], i],
+                    circle_penalty=self.circle_lambda,
+                )
+            else:
+                logging.debug(f"Loss function {loss_fn} does not accept circle_penalty")
+                l = loss_fn(
+                    predicted_noise[unmask_idx[0], unmask_idx[1], i],
+                    known_noise[unmask_idx[0], unmask_idx[1], i],
+                )
+            loss_terms.append(l)
+        if write_preds is not None:
+            with open(write_preds, "w") as f:
+                d_to_write = {
+                    "known_noise": known_noise.cpu().numpy().tolist(),
+                    "predicted_noise": predicted_noise.cpu().numpy().tolist(),
+                    "attn_mask": batch["attn_mask"].cpu().numpy().tolist(),
+                    "losses": [l.item() for l in loss_terms],
+                }
+                json.dump(d_to_write, f)
+
+        if (
+            isinstance(self.use_pairwise_dist_loss, (list, tuple))
+            or self.use_pairwise_dist_loss > 0
+        ):
+            # Compute the pairwise distance loss
+            bs = batch["sqrt_one_minus_alphas_cumprod_t"].shape[0]
+            # The alpha* have shape of [batch], e.g. [32]
+            # corrupted have shape of [batch, seq_len, num_angles], e.g. [32, 128, 6]
+            denoised_angles = (
+                batch["corrupted"]
+                - batch["sqrt_one_minus_alphas_cumprod_t"].view(bs, 1, 1)
+                * predicted_noise
+            )
+            denoised_angles /= batch["sqrt_alphas_cumprod_t"].view(bs, 1, 1)
+
+            known_angles = batch["angles"]
+            inferred_coords = nerf.nerf_build_batch(
+                phi=known_angles[:, :, self.ft_names.index("phi")],
+                psi=known_angles[:, :, self.ft_names.index("psi")],
+                omega=known_angles[:, :, self.ft_names.index("omega")],
+                bond_angle_n_ca_c=known_angles[:, :, self.ft_names.index("tau")],
+                bond_angle_ca_c_n=known_angles[:, :, self.ft_names.index("CA:C:1N")],
+                bond_angle_c_n_ca=known_angles[:, :, self.ft_names.index("C:1N:1CA")],
+            )
+            denoised_coords = nerf.nerf_build_batch(
+                phi=denoised_angles[:, :, self.ft_names.index("phi")],
+                psi=denoised_angles[:, :, self.ft_names.index("psi")],
+                omega=denoised_angles[:, :, self.ft_names.index("omega")],
+                bond_angle_n_ca_c=denoised_angles[:, :, self.ft_names.index("tau")],
+                bond_angle_ca_c_n=denoised_angles[:, :, self.ft_names.index("CA:C:1N")],
+                bond_angle_c_n_ca=denoised_angles[
+                    :, :, self.ft_names.index("C:1N:1CA")
+                ],
+            )
+            ca_idx = torch.arange(start=1, end=denoised_coords.shape[1], step=3)
+            denoised_ca_coords = denoised_coords[:, ca_idx, :]
+            inferred_ca_coords = inferred_coords[:, ca_idx, :]
+            assert (
+                inferred_ca_coords.shape == denoised_ca_coords.shape
+            ), f"{inferred_ca_coords.shape} != {denoised_ca_coords.shape}"
+
+            # Determine coefficient for this loss term
+            if isinstance(self.use_pairwise_dist_loss, (list, tuple)):
+                min_coef, max_coef, max_timesteps = self.use_pairwise_dist_loss
+                assert 0 < min_coef < max_coef
+                # Linearly interpolate between min and max based on the timestep
+                # of each item in the batch
+                coef = min_coef + (max_coef - min_coef) * (
+                    (max_timesteps - batch["t"]) / max_timesteps
+                ).to(batch["t"].device)
+                assert torch.all(coef > 0)
+            else:
+                coef = self.use_pairwise_dist_loss
+                assert coef > 0
+
+            pdist_loss = losses.pairwise_dist_loss(
+                denoised_ca_coords,
+                inferred_ca_coords,
+                lengths=batch["lengths"],
+                weights=coef,
+            )
+            loss_terms.append(pdist_loss)
+
+        return torch.stack(loss_terms)
+    
+    def loss(self, batch):
+        if self.method == "reinforce":
+            return reinforce(batch)
+        if self.method == "reinforce_pos":
+            return reinforce_pos(batch)
+        elif self.method == "vanilla":
+            return vanilla_pg(batch)
+    
+
+    def training_step(self, batch, batch_idx):
+        """
+        Training step, runs once per batch
+        Modified thanks to the PyTorch Lightning Docs! 
+        https://github.com/Lightning-Universe/lightning-bolts/blob/0.5.0/pl_bolts/models/rl/reinforce_model.py#L26-L302
+        """
+        loss_terms = self.loss(batch) # mean here, instead of in self.loss
+        if isinstance(loss_terms, list):
+            loss_terms = torch.stack(loss_terms)
+        avg_loss = torch.mean(loss_terms)
+        # really make sure it's a scalar!
+        avg_loss = torch.mean(avg_loss)
+        
+
+        # TODO: what do I want to log: 
+        # - the average reward across trajectories
+        # - the average loss across trajectories
+
+        # samples, rewards, log_probs = batch
+        # loss_terms = self._get_loss_terms(batch)
+
+        log = {
+            # "episodes": self.done_episodes,
+            "avg_loss": avg_loss,
+            # "avg_reward": rewards.mean(),
+        }
+
+
+        # L1 loss implementation
+        if self.l1_lambda > 0:
+            l1_penalty = sum(torch.linalg.norm(p, 1) for p in self.parameters())
+            avg_loss += self.l1_lambda * l1_penalty
+
+        pseudo_ft_names = (
+            (self.ft_names + ["pairwise_dist_loss"])
+            if self.use_pairwise_dist_loss
+            else self.ft_names
+        )
+        loss_terms = torch.squeeze(loss_terms)
+        assert len(loss_terms) == len(pseudo_ft_names)
+        loss_dict = {
+            f"train_loss_{val_name}": torch.mean(val)
+            for val_name, val in zip(pseudo_ft_names, loss_terms)
+        }
+        loss_dict["train_loss"] = avg_loss
+        self.log_dict(loss_dict)  # Don't seem to need rank zero or sync dist
+        self.log_dict(log)
+
+        return avg_loss
+
+    def training_epoch_end(self, outputs) -> None:
+        """Log the average training loss over the epoch"""
+        losses = torch.stack([o["loss"] for o in outputs])
+        mean_loss = torch.mean(losses)
+        mean_loss = torch.mean(mean_loss)
+        t_delta = time.time() - self.train_epoch_last_time
+        pl.utilities.rank_zero_info(
+            f"Train loss at epoch {self.train_epoch_counter} end: {mean_loss:.4f} ({t_delta:.2f} seconds)"
+        )
+        # Increment counter and timers
+        self.train_epoch_counter += 1
+        self.train_epoch_last_time = time.time()
+        self.log('train_loss', mean_loss)
+        
+
+    def validation_step(self, batch, batch_idx) -> Dict[str, torch.Tensor]:
+        """
+        Validation step
+        """
+        with torch.no_grad():
+            loss_terms = self._get_loss_terms(
+                batch,
+                write_preds=os.path.join(
+                    self.write_preds_to_dir, f"{self.write_preds_counter}_preds.json"
+                )
+                if self.write_preds_to_dir
+                else None,
+            )
+            self.write_preds_counter += 1
+        avg_loss = torch.mean(loss_terms)
+
+        # Log each of the loss terms
+        pseudo_ft_names = (
+            (self.ft_names + ["pairwise_dist_loss"])
+            if self.use_pairwise_dist_loss
+            else self.ft_names
+        )
+        assert len(loss_terms) == len(pseudo_ft_names)
+        loss_dict = {
+            f"val_loss_{val_name}": self.all_gather(val)
+            for val_name, val in zip(pseudo_ft_names, loss_terms)
+        }
+        loss_dict["val_loss"] = avg_loss
+        # with rank zero it seems that we don't need to use sync_dist
+        self.log_dict(loss_dict, rank_zero_only=True)
+
+        return {"val_loss": avg_loss}
+
+    def validation_epoch_end(self, outputs) -> None:
+        """Log the average validation loss over the epoch"""
+        # Note that this method is called before zstraining_epoch_end().
+        losses = torch.stack([o["val_loss"] for o in outputs])
+        mean_loss = torch.mean(losses)
+        pl.utilities.rank_zero_info(
+            f"Valid loss at epoch {self.train_epoch_counter} end: {mean_loss:.4f}"
+        )
+
+    def configure_optimizers(self) -> Dict[str, Any]:
+        """
+        Return optimizer. Limited support for some optimizers
+        """
+        optim = torch.optim.AdamW(
+            self.parameters(),
+            lr=self.learning_rate,
+            weight_decay=self.l2_lambda,
+        )
+        retval = {"optimizer": optim}
+        if self.lr_scheduler:
+            if self.lr_scheduler == "OneCycleLR":
+                retval["lr_scheduler"] = {
+                    "scheduler": torch.optim.lr_scheduler.OneCycleLR(
+                        optim,
+                        max_lr=1e-2,
+                        epochs=self.epochs,
+                        steps_per_epoch=self.steps_per_epoch,
+                    ),
+                    "monitor": "val_loss",
+                    "frequency": 1,
+                    "interval": "step",
+                }
+            elif self.lr_scheduler == "LinearWarmup":
+                # https://huggingface.co/docs/transformers/v4.21.2/en/main_classes/optimizer_schedules#transformers.get_linear_schedule_with_warmup
+                # Transformers typically do well with linear warmup
+                warmup_steps = int(self.epochs * 0.1)
+                pl.utilities.rank_zero_info(
+                    f"Using linear warmup with {warmup_steps}/{self.epochs} warmup steps"
+                )
+                retval["lr_scheduler"] = {
+                    "scheduler": get_linear_schedule_with_warmup(
+                        optim,
+                        num_warmup_steps=warmup_steps,
+                        num_training_steps=self.epochs,
+                    ),
+                    "frequency": 1,
+                    "interval": "epoch",  # Call after 1 epoch
+                }
+            else:
+                raise ValueError(f"Unknown lr scheduler {self.lr_scheduler}")
+        pl.utilities.rank_zero_info(f"Using optimizer {retval}")
+        return retval
+    
+    def set_rl_train_config(self, from_ckpt_dir, lengths, num, 
+                            sampling_batch_size, train_batch_size, 
+                            inner_loop):
+        self.from_ckpt_dir = from_ckpt_dir
+        self.lengths = lengths
+        self.num = num
+        self.sampling_batch_size = sampling_batch_size
+        self.train_batch_size = train_batch_size
+        self.inner_loop = inner_loop
+
+    def set_reward_config(self, 
+            new_results_dir,
+            gen_pdb_outdir, mpnn_replicates, mpnn_outdir,
+            omegafold_gpus, omegafold_outdir, sctm_score_file): # TODO: fix args 
+        self.reward_config = {
+            "new_results_dir": new_results_dir,
+            "gen_pdb_outdir": gen_pdb_outdir,
+            "mpnn_replicates": mpnn_replicates,
+            "mpnn_outdir": mpnn_outdir,
+            "omegafold_gpus": omegafold_gpus,
+            "omegafold_outdir": omegafold_outdir,
+            "sctm_score_dir": "sctm_scores", 
+            "sctm_score_file": sctm_score_file,
+            "abs_step": 0,
+        }
+        self.reward_fn = RewardStructure(self.reward_config)
+
+        # Load the dataset based on training args
+        self.train_dset, _, self.test_dset = build_datasets(
+            # load_actual is only true if we want comparison done on a particular test set ! 
+            Path(self.from_ckpt_dir), load_actual=False,
+        )
+        phi_idx = self.test_dset.feature_names["angles"].index("phi")
+        psi_idx = self.test_dset.feature_names["angles"].index("psi")
+        # Fetch values for training distribution
+        select_by_attn = lambda x: x["angles"][x["attn_mask"] != 0]
+
+    
+    def trajectory_batch(self):
+        # samples
+        # use code in foldingdiff/sampling.py and bin/sample.py to help produce samples from this model
+        # score the samples x_0, stored as directory of sequences.
+        
+        
+        # so, I need to 1) collect rewards by the redunancy I have?
+        # Then average along that dimension
+        # Create a dataset from the trajectory
+        curr_batch_count = 0
+        while True:
+            if curr_batch_count > self.train_batch_size:
+                break
+            curr_batch_count += 1 
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
+            # model is already loaded 
+            self = self.to(torch.device(device))
+
+
+            sweep_min_len, sweep_max_len = self.lengths
+            assert sweep_min_len < sweep_max_len
+            assert sweep_max_len <= self.train_dset.dset.pad
+
+            # maybe pick a random length to use each time???
+            length_to_use = np.random.choice(range(sweep_min_len, sweep_max_len))
+
+            # what is the train_dset?
+            # Perform sampling
+            sampled, log_probs = sampling.sample( # new_sample(
+                self,
+                self.train_dset,
+                n=self.num,
+                sweep_lengths=(length_to_use, length_to_use + 1),
+                batch_size=self.sampling_batch_size
+            )
+            # first round of optimization
+            final_sampled = [s[-1] for s in sampled]
+
+            rewards = self.reward_fn.compute_scTM_scores(final_sampled = final_sampled,
+                                                        feature_names = self.train_dset.feature_names["angles"], 
+                                                        device = torch.cuda.current_device(),
+                                                        )
+            #rewards = torch.tensor([np.random.normal(3, 5) for _ in final_sampled], device=device) # compute_scTM_scores(final_sampled)
+            sampled, rewards, log_probs
+
+            samples_tensor = torch.nested.nested_tensor(sampled, dtype=torch.float32) # TODO: is this the right type
+            rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
+            log_probs_tensor = torch.nested.nested_tensor(log_probs, dtype=torch.float32)
+
+            yield samples_tensor, rewards_tensor, log_probs_tensor
+            # subsequent loops of optimization with the same samples: now that the model has updated, compute the new probs and the resulting ratio. 
+            # also TODO: need to add self.inner_loop
+            # also TODO: need to compute advantages, but shouldn't be too hard. 
+            inner_loop_count = 0
+            while inner_loop_count < self.inner_loop: #  inner_loop
+                inner_loop_count += 1
+                # final_sampled = [s[-1] for s in sampled]
+                new_log_probs = sampling.sample(
+                    self,
+                    self.train_dset,
+                    n=self.num,
+                    sweep_lengths=(length_to_use, length_to_use + 1),
+                    batch_size=self.sampling_batch_size,
+                    samples = sampled
+                ) # can add in sampling_utils instead?
+                sampled, rewards, new_log_probs
+
+                samples_tensor = torch.nested.nested_tensor(sampled, dtype=torch.float32) # TODO: is this the right type
+                rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
+                new_log_probs_tensor = torch.nested.nested_tensor(new_log_probs, dtype=torch.float32)
+
+                yield samples_tensor, rewards_tensor, new_log_probs_tensor
+            
+
+    def _dataloader(self) -> DataLoader:
+        ## Creates a new set of trajectories? 
+        # TODO: Come back to https://github.com/Lightning-Universe/lightning-bolts/blob/0.5.0/pl_bolts/models/rl/reinforce_model.py#L26-L302
+        """Initialize the dataset used for getting trajectories"""
+        # need wrapper class for this. 
+        dataset = TrajectoryDataset(self.trajectory_batch)
+        dataloader = DataLoader(dataset=dataset, 
+                                batch_size=self.train_batch_size,
+                                num_workers=0,
+                                collate_fn = lambda batch: batch) # setting this differently spawns on CUDA!
+        return dataloader
+
+    def train_dataloader(self) -> DataLoader:
+        """Get train loader."""
+        return self._dataloader()
+
+
+
+
+
+
 
 class BertForAutoregressiveBase(BertForDiffusionBase):
     """
