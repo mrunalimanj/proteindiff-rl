@@ -486,7 +486,10 @@ def train_again(
 
     
     # <----------------------------------  model TRAINING  ----------------------------------> 
-    model.set_rl_train_config(from_ckpt_dir, lengths, sampling_num, sampling_batch_size, train_batch_size = 6, )
+    model.set_rl_train_config(from_ckpt_dir, lengths, 
+                              sampling_num, sampling_batch_size, 
+                              train_batch_size = 6,
+                              inner_loop = 3 if "reinforce" not in method else 0,)
     model.set_reward_config(new_results_dir, gen_pdb_outdir, mpnn_replicates, mpnn_outdir,
             omegafold_gpus, omegafold_outdir, sctm_score_file)
     trainer.fit(

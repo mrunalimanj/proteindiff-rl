@@ -82,6 +82,34 @@ def max_tm_across_refs(
 
     return np.nanmax(values), references[np.argmax(values)]
 
+def all_tm_across_refs(
+    query: str,
+    references: List[str],
+    n_threads: int = mp.cpu_count(),
+    fast: bool = True,
+    chunksize: int = 10,
+    parallel: bool = True,
+) -> Tuple[float, str]:
+    """
+    Compare the query against each of the references in parallel and return all scores (only scores)
+    This is typically a lot of comparisons so we run with fast set to True by default
+    """
+    logging.debug(
+        f"Matching against {len(references)} references using {n_threads} workers with fast={fast}"
+    )
+    args = [(query, ref, fast) for ref in references]
+    if parallel and len(references) > 1:
+        n_threads = min(n_threads, len(references))
+        pool = mp.Pool(n_threads)
+        values = list(pool.starmap(run_tmalign, args, chunksize=chunksize))
+        pool.close()
+        pool.join()
+    else:
+        values = list(itertools.starmap(run_tmalign, args))
+
+    values = np.array(values)
+    return values[~np.isnan(values)]
+
 
 def match_files(
     query_files: Collection[str],

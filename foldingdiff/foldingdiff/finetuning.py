@@ -846,13 +846,15 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         pl.utilities.rank_zero_info(f"Using optimizer {retval}")
         return retval
     
-    def set_rl_train_config(self, from_ckpt_dir, lengths, num, sampling_batch_size, train_batch_size):
+    def set_rl_train_config(self, from_ckpt_dir, lengths, num, 
+                            sampling_batch_size, train_batch_size, 
+                            inner_loop):
         self.from_ckpt_dir = from_ckpt_dir
         self.lengths = lengths
         self.num = num
         self.sampling_batch_size = sampling_batch_size
         self.train_batch_size = train_batch_size
-
+        self.inner_loop = inner_loop
 
     def set_reward_config(self, 
             new_results_dir,
@@ -865,9 +867,9 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
             "mpnn_outdir": mpnn_outdir,
             "omegafold_gpus": omegafold_gpus,
             "omegafold_outdir": omegafold_outdir,
+            "sctm_score_dir": "sctm_scores", 
             "sctm_score_file": sctm_score_file,
-            
-
+            "abs_step": 0,
         }
         self.reward_fn = RewardStructure(self.reward_config)
 
@@ -918,26 +920,43 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
                 sweep_lengths=(length_to_use, length_to_use + 1),
                 batch_size=self.sampling_batch_size
             )
-
+            # first round of optimization
             final_sampled = [s[-1] for s in sampled]
 
             rewards = self.reward_fn.compute_scTM_scores(final_sampled = final_sampled,
                                                         feature_names = self.train_dset.feature_names["angles"], 
-                                                        device = torch.cuda.current_device())
-
-
+                                                        device = torch.cuda.current_device(),
+                                                        )
             #rewards = torch.tensor([np.random.normal(3, 5) for _ in final_sampled], device=device) # compute_scTM_scores(final_sampled)
-
             sampled, rewards, log_probs
-
-            # First you gotta optimize the training loop
-            # And also make sure it learns!! AKA has gradients!!
 
             samples_tensor = torch.nested.nested_tensor(sampled, dtype=torch.float32) # TODO: is this the right type
             rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
             log_probs_tensor = torch.nested.nested_tensor(log_probs, dtype=torch.float32)
 
             yield samples_tensor, rewards_tensor, log_probs_tensor
+            # subsequent loops of optimization with the same samples: now that the model has updated, compute the new probs and the resulting ratio. 
+            # also TODO: need to add self.inner_loop
+            # also TODO: need to compute advantages, but shouldn't be too hard. 
+            inner_loop_count = 0
+            while inner_loop_count < self.inner_loop: #  inner_loop
+                inner_loop_count += 1
+                # final_sampled = [s[-1] for s in sampled]
+                new_log_probs = sampling.sample(
+                    self,
+                    self.train_dset,
+                    n=self.num,
+                    sweep_lengths=(length_to_use, length_to_use + 1),
+                    batch_size=self.sampling_batch_size,
+                    samples = sampled
+                ) # can add in sampling_utils instead?
+                sampled, rewards, new_log_probs
+
+                samples_tensor = torch.nested.nested_tensor(sampled, dtype=torch.float32) # TODO: is this the right type
+                rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
+                new_log_probs_tensor = torch.nested.nested_tensor(new_log_probs, dtype=torch.float32)
+
+                yield samples_tensor, rewards_tensor, new_log_probs_tensor
             
 
     def _dataloader(self) -> DataLoader:
@@ -956,7 +975,6 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         """Get train loader."""
         return self._dataloader()
     
-
 
 class BertForAutoregressiveBase(BertForDiffusionBase):
     """

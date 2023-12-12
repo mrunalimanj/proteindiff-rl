@@ -273,7 +273,7 @@ def build_datasets(
 class RewardStructure():
     def __init__(self, config):
         self.config = config
-        for subpath in ["gen_pdb_outdir", "mpnn_outdir", "omegafold_outdir"]:
+        for subpath in ["gen_pdb_outdir", "mpnn_outdir", "omegafold_outdir", "sctm_score_dir"]:
             self.config[subpath] = os.path.join(self.config["new_results_dir"], subpath)
             os.makedirs(self.config[subpath], exist_ok=True)
 
@@ -543,16 +543,31 @@ class RewardStructure():
             )
         if not folded_pdbs:
             return np.nan, ""
-        return tmalign.max_tm_across_refs(orig_pdb, folded_pdbs, parallel=False)
+        return tmalign.max_tm_across_refs(orig_pdb, folded_pdbs, parallel=True)
+
+    def get_all_sctm_scores(self, orig_pdb: Path, folded_dirname: Path) -> Tuple[float, str]:
+        """get the self-consistency tm score"""
+        bname = os.path.splitext(os.path.basename(orig_pdb))[0] + "_*_residues_*.pdb"
+        folded_pdbs = glob.glob(os.path.join(folded_dirname, bname))
+        assert len(folded_pdbs) <= 10  # We have never run more than 10 per before
+        if len(folded_pdbs) > 8:
+            folded_pdbs = folded_pdbs[:8]
+        assert len(folded_pdbs) <= 8
+        if len(folded_pdbs) < 8:
+            logging.warning(
+                f"Fewer than 8 (n={len(folded_pdbs)}) structures corresponding to {orig_pdb}"
+            )
+        if not folded_pdbs:
+            return np.nan, ""
+        return tmalign.all_tm_across_refs(orig_pdb, folded_pdbs, parallel=True)
 
 
-    def score_structures(self, folded, predicted):
+    def score_structures(self, folded, predicted, step):
         """
-        folded is the generated backbone structures, from the sampler
-        predicted is the structures from the inverse folding test"""
+        folded is the structures from the inverse folding test
+        predicted is the generated backbone structures, from the sampler"""
         # assert os.path.isdir(folded)
         assert os.path.isdir(predicted), f"Directory not found: {predicted}"
-
         # TODO: make sure this is right
         # perhaps need to wait until all files are done computing. 
         orig_predicted_backbones = glob.glob(os.path.join(predicted, "*.pdb"))
@@ -576,25 +591,30 @@ class RewardStructure():
             }
 
         # Match up the files
-        pfunc = functools.partial(self.get_sctm_score, folded_dirname=Path(folded))
+        pfunc = functools.partial(self.get_all_sctm_scores, folded_dirname=Path(folded))
         pool = mp.Pool(mp.cpu_count())
         sctm_scores_raw_and_ref = list(
             pool.map(pfunc, orig_predicted_backbones, chunksize=5)
         )
         pool.close()
         pool.join()
-
+        print(sctm_scores_raw_and_ref)
         sctm_non_nan_idx = [
             i for i, (val, _) in enumerate(sctm_scores_raw_and_ref) if ~np.isnan(val)
         ]
-        sctm_scores_mapping = {
-            orig_predicted_backbone_names[i]: sctm_scores_raw_and_ref[i][0]
+        full_sctm_scores_mapping = {
+            orig_predicted_backbone_names[i]: sctm_scores_raw_and_ref[i]
             for i in sctm_non_nan_idx
         }
-        sctm_scores_reference = {
-            orig_predicted_backbone_names[i]: sctm_scores_raw_and_ref[i][1]
-            for i in sctm_non_nan_idx
-        }
+        # sctm_scores_reference = {
+        #    orig_predicted_backbone_names[i]: sctm_scores_raw_and_ref[i][1]
+        #    for i in sctm_non_nan_idx
+        # }
+        sctm_file = os.path.join(self.config["sctm_score_dir"], f"{self.config['sctm_score_file']}_step_{step}.json")
+        with open(sctm_file, "w") as sink:
+            json.dump(full_sctm_scores_mapping, sink, indent=4)
+        
+        sctm_scores_mapping = {backbone: max(scores) for backbone, scores in full_sctm_scores_mapping.items()}
         sctm_scores = np.array(list(sctm_scores_mapping.values()))
 
         passing_num = np.sum(sctm_scores >= 0.5)
@@ -606,9 +626,7 @@ class RewardStructure():
         logging.info(
             f"scTM score mean/median: {np.mean(sctm_scores), np.median(sctm_scores)}"
         )
-        with open(self.config["sctm_score_file"] + ".json", "w") as sink:
-            json.dump(sctm_scores_mapping, sink, indent=4)
-
+        
         # Need to return one score for each structure!
         grouped_sctm_scores = {}
         dev_values = set([int(re.findall(r'dev_(\d+)', file_name)[0]) for file_name in sctm_scores_mapping.keys()])
@@ -625,6 +643,7 @@ class RewardStructure():
     # <------------------------- R_total: End-to-end computation ------------------------------------->
 
     def compute_scTM_scores(self, final_sampled, feature_names, device):
+        self.config["abs_step"] += 1
         pdbs_written = self.write_preds_pdb_folder(final_sampled, feature_names = feature_names, device=device)
         mpnns_written = self.pdbs_to_seqs(pdbs_written, device=device)
         # above is debugged 
@@ -632,5 +651,6 @@ class RewardStructure():
         print("rewards successfully computed for this epoch?")
         orig_pdb_folder = self.config["gen_pdb_outdir"]
         new_pdbs_folder = self.config["omegafold_outdir"]
-        rewards = self.score_structures(predicted = orig_pdb_folder, folded = new_pdbs_folder)
+        rewards = self.score_structures(predicted = orig_pdb_folder, folded = new_pdbs_folder,
+                                        step = self.config["abs_step"])
         return rewards 
