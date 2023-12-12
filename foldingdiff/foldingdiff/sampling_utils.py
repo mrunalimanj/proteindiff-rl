@@ -8,6 +8,7 @@ import json
 import logging
 import functools
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import Dataset, IterableDataset
 import glob
@@ -300,8 +301,9 @@ class RewardStructure():
         sampled_dfs = [
         pd.DataFrame(s, columns=feature_names)
         for s in final_sampled]
+        seqlen = final_sampled[0].shape[0]
         arg_tuples = [
-            (os.path.join(gen_pdb_outdir, f"{basename_prefix}{i}_dev_{device}.pdb"), samp)
+            (os.path.join(gen_pdb_outdir, f"{basename_prefix}{i}_len_{seqlen}_dev_{device}.pdb"), samp)
             for i, samp in enumerate(sampled_dfs)
         ]
         # Write in parallel
@@ -543,7 +545,7 @@ class RewardStructure():
             )
         if not folded_pdbs:
             return np.nan, ""
-        return tmalign.max_tm_across_refs(orig_pdb, folded_pdbs, parallel=True)
+        return tmalign.max_tm_across_refs(orig_pdb, folded_pdbs, parallel=False)
 
     def get_all_sctm_scores(self, orig_pdb: Path, folded_dirname: Path) -> Tuple[float, str]:
         """get the self-consistency tm score"""
@@ -559,7 +561,7 @@ class RewardStructure():
             )
         if not folded_pdbs:
             return np.nan, ""
-        return tmalign.all_tm_across_refs(orig_pdb, folded_pdbs, parallel=True)
+        return tmalign.all_tm_across_refs(orig_pdb, folded_pdbs, parallel=False)
 
 
     def score_structures(self, folded, predicted, step):
@@ -610,9 +612,10 @@ class RewardStructure():
         #    orig_predicted_backbone_names[i]: sctm_scores_raw_and_ref[i][1]
         #    for i in sctm_non_nan_idx
         # }
-        sctm_file = os.path.join(self.config["sctm_score_dir"], f"{self.config['sctm_score_file']}_step_{step}.json")
-        with open(sctm_file, "w") as sink:
-            json.dump(full_sctm_scores_mapping, sink, indent=4)
+        sctm_file = os.path.join(self.config["sctm_score_dir"], f"{self.config['sctm_score_file']}_step_{step}.csv")
+        scores_all_df = pd.DataFrame.from_dict(full_sctm_scores_mapping, orient = 'index').reset_index()
+        scores_all_df.to_csv(sctm_file, index = False)
+        
         
         sctm_scores_mapping = {backbone: max(scores) for backbone, scores in full_sctm_scores_mapping.items()}
         sctm_scores = np.array(list(sctm_scores_mapping.values()))

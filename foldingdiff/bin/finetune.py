@@ -319,7 +319,7 @@ def train_again(
     use_swa: bool = False,  # Stochastic weight averaging can improve training genearlization
     ## related to learning method
     method: str = "reinforce", # TODO: where is the seed set?
-    lengths: Tuple[int, int] = (100, 128), 
+    lengths: Tuple[int, int] = (100, 200), 
     sampling_num: int = 4,
     sampling_batch_size: int = 512, 
 
