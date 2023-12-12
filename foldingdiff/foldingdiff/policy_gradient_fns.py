@@ -2,8 +2,6 @@ import torch
 
 def reinforce(batch):
     """REINFORCE algorithm"""
-    print("batch size", len(batch))
-    print("is there a first example? what is it's shape?", len(batch[0]))
     if len(batch) != 3:
         batch_list = batch
         policy_loss = []
@@ -11,7 +9,7 @@ def reinforce(batch):
             samples, rewards, log_probs = batch
             policy_loss = []
             # print("back log probs", log_probs[0][-1]) # this is the one to diagnose... 
-            print("log_probs", log_probs) # these log_probabilities aren't gettign computed correctly :(
+            # print("log_probs", log_probs) # these log_probabilities aren't gettign computed correctly :(
             overall_log_probs = torch.stack([log_prob.nansum(dim=tuple(range(log_prob.ndim - 1))) for log_prob in log_probs]).requires_grad_()
             loss = -overall_log_probs * rewards[:, None]
             policy_loss.append(loss.transpose(0, 1))
@@ -24,6 +22,34 @@ def reinforce(batch):
         overall_log_probs = torch.stack([log_prob.nansum(dim=tuple(range(log_prob.ndim - 1))) for log_prob in log_probs]).requires_grad_()
         loss = -overall_log_probs * rewards[:, None]
         return loss.transpose(0, 1)
+
+def reinforce_pos(batch):
+    """REINFORCE algorithm"""
+    if len(batch) != 3:
+        batch_list = batch
+        policy_loss = []
+        for batch in batch_list:
+            samples, rewards, log_probs = batch
+            policy_loss = []
+            # print("back log probs", log_probs[0][-1]) # this is the one to diagnose... 
+            # print("log_probs", log_probs) # these log_probabilities aren't gettign computed correctly :(
+            # flatten any positive values to 0
+        
+            # log_probs = torch.where(log_probs > 0, torch.zeros_like(log_probs), log_probs)
+            overall_log_probs = torch.stack([torch.where(log_prob > 0, torch.zeros_like(log_prob), log_prob).nansum(dim=tuple(range(log_prob.ndim - 1))) for log_prob in log_probs]).requires_grad_()
+            loss = -overall_log_probs * rewards[:, None]
+            policy_loss.append(loss.transpose(0, 1))
+            
+        return policy_loss # TODO: hopefully this remains 2-dimensional?
+    else: 
+        samples, rewards, log_probs = batch
+        policy_loss = []
+        
+        overall_log_probs = torch.stack([torch.where(log_prob > 0, torch.zeros_like(log_prob), log_prob).nansum(dim=tuple(range(log_prob.ndim - 1))) for log_prob in log_probs]).requires_grad_()
+        loss = -overall_log_probs * rewards[:, None]
+        return loss.transpose(0, 1)
+
+
 
 
 

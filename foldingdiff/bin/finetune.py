@@ -471,7 +471,7 @@ def train_again(
         #check_val_every_n_epoch=1,
         callbacks=callbacks,
         logger=pl.loggers.CSVLogger(save_dir=new_results_folder / "logs"),
-        log_every_n_steps=32, # min(200, len(train_dataloader)),  # Log >= once per epoch
+        log_every_n_steps=2, # min(200, len(train_dataloader)),  # Log >= once per epoch
         accelerator=accelerator,
         strategy=strategy,
         gpus=ngpu,
@@ -758,6 +758,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory to write model training outputs",
     )
     parser.add_argument(
+        "-m",
+        "--rl_method",
+        type=str,
+        default="reinforce",
+        help="Policy gradient method to use",
+    )
+    parser.add_argument(
         "--toy",
         type=int,
         default=None,
@@ -795,6 +802,7 @@ def main():
             "cpu_only": args.cpu,
             "ngpu": args.ngpu,
             "dryrun": args.dryrun,
+            "method": args.rl_method,
         },
     )
     train_again(**config_args)

@@ -87,13 +87,9 @@ def p_sample(
             - torch.log(torch.sqrt(posterior_variance_t))
             - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
         )
-        # flatten any positive values to 0
-        
-        log_prob = torch.where(log_prob > 0, torch.zeros_like(log_prob), log_prob)
         # mean along all but batch dimension # TODO: what is the batch dimension here?
         # log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
         
-        assert (log_prob <= 0).all().item(), f"log_probabilities should be negative but instead were {log_prob}"
         # print(f"log probs all neg at time step {t_index}")
         return x_t_minus_1, log_prob
 

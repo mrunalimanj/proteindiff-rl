@@ -689,6 +689,8 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
     def loss(self, batch):
         if self.method == "reinforce":
             return reinforce(batch)
+        if self.method == "reinforce_pos":
+            return reinforce_pos(batch)
         elif self.method == "vanilla":
             return vanilla_pg(batch)
     
@@ -734,7 +736,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         loss_terms = torch.squeeze(loss_terms)
         assert len(loss_terms) == len(pseudo_ft_names)
         loss_dict = {
-            f"train_loss_{val_name}": val
+            f"train_loss_{val_name}": torch.mean(val)
             for val_name, val in zip(pseudo_ft_names, loss_terms)
         }
         loss_dict["train_loss"] = avg_loss
@@ -756,6 +758,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         self.train_epoch_counter += 1
         self.train_epoch_last_time = time.time()
         self.log('train_loss', mean_loss)
+        
 
     def validation_step(self, batch, batch_idx) -> Dict[str, torch.Tensor]:
         """
