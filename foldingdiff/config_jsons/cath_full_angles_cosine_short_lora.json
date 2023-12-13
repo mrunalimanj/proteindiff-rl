@@ -1,0 +1,22 @@
+{
+    "from_ckpt_dir": "/home/mrunali/project/proteindiff-rl/model_runs/lora_ckpt_start",
+    "angles_definitions": "canonical-full-angles",
+    "timesteps": 1000,
+    "max_seq_len": 128,
+    "min_seq_len": 40,
+    "trim_strategy": "randomcrop",
+    "variance_schedule": "cosine",
+    "variance_scale": 1.0,
+    "gradient_clip": 1.0,
+    "loss": "smooth_l1",
+    "min_epochs": 100,
+    "max_epochs": 250,
+    "early_stop_patience": 0,
+    "use_swa": false,
+    "batch_size": 64,
+    "multithread": true
+}
+
+
+    
+    

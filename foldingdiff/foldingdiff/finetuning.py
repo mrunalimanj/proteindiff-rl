@@ -38,7 +38,7 @@ from foldingdiff.datasets import FEATURE_SET_NAMES_TO_ANGULARITY
 from foldingdiff.policy_gradient_fns import *
 from foldingdiff.sampling_utils import * 
 from foldingdiff import sampling
-from foldingdiff.sampling_utils import sample as new_sample
+from foldingdiff.sampling_utils import p_probs_loop
 
 LR_SCHEDULE = Optional[Literal["OneCycleLR", "LinearWarmup"]]
 TIME_ENCODING = Literal["gaussian_fourier", "sinusoidal"]
@@ -944,7 +944,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
             while inner_loop_count < self.inner_loop: #  inner_loop
                 inner_loop_count += 1
                 # final_sampled = [s[-1] for s in sampled]
-                new_log_probs = sampling.sample(
+                new_log_probs = p_probs_loop(
                     self,
                     self.train_dset,
                     n=self.num,
@@ -952,13 +952,16 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
                     batch_size=self.sampling_batch_size,
                     samples = sampled
                 ) # can add in sampling_utils instead?
-                sampled, rewards, new_log_probs
+                advantages = rewards - rewards.mean()
+                sampled, advantages, new_log_probs
+                importances = torch.exp(new_log_probs - log_probs_tensor)
 
                 samples_tensor = torch.nested.nested_tensor(sampled, dtype=torch.float32) # TODO: is this the right type
-                rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
+                importances_tensor = torch.nested.nested_tensor(importances, dtype=torch.float32)
+                advantages_tensor = torch.tensor(advantages, dtype=torch.float32)
                 new_log_probs_tensor = torch.nested.nested_tensor(new_log_probs, dtype=torch.float32)
 
-                yield samples_tensor, rewards_tensor, new_log_probs_tensor
+                yield samples_tensor, advantages_tensor, new_log_probs_tensor, importances_tensor
             
 
     def _dataloader(self) -> DataLoader:
@@ -1433,7 +1436,7 @@ class BertForDiffusionLoRA(BertForDiffusionBase, pl.LightningModule):
             while inner_loop_count < self.inner_loop: #  inner_loop
                 inner_loop_count += 1
                 # final_sampled = [s[-1] for s in sampled]
-                new_log_probs = sampling.sample(
+                new_log_probs = sampling_tuils(
                     self,
                     self.train_dset,
                     n=self.num,

@@ -50,9 +50,6 @@ def reinforce_pos(batch):
         return loss.transpose(0, 1)
 
 
-
-
-
 def vanilla_pg(batch):
     entropy_beta = 0.01 # per https://arxiv.org/pdf/1704.06440.pdf except not really because Copilot might be hallucinating
     samples, rewards, log_probs = batch
@@ -73,3 +70,31 @@ def vanilla_pg(batch):
     loss = policy_loss + entropy_loss
 
     return loss
+
+
+def ppo(batch):
+    """Proximal Policy Optimization algorithm"""
+    if len(batch) != 3:
+        batch_list = batch
+        policy_loss = []
+        for batch in batch_list:
+            samples, advs, new_log_probs, importances = batch
+            # Implement proximal policy optimization
+
+            # print("back log probs", log_probs[0][-1]) # this is the one to diagnose... 
+            # print("log_probs", log_probs) # these log_probabilities aren't gettign computed correctly :(
+            surrogate1 = importances * advs
+            surrogate2 = torch.clamp(importances, 1.0 - 0.2, 1.0 + 0.2) * advs
+            policy_loss.append(-torch.min(surrogate1, surrogate2).mean().transpose(0, 1))
+            
+        return policy_loss # TODO: hopefully this remains 2-dimensional?
+    else: 
+        samples, advs, new_log_probs, importances = batch
+            # Implement proximal policy optimization
+
+            # print("back log probs", log_probs[0][-1]) # this is the one to diagnose... 
+            # print("log_probs", log_probs) # these log_probabilities aren't gettign computed correctly :(
+            surrogate1 = importances * advs
+            surrogate2 = torch.clamp(importances, 1.0 - 0.2, 1.0 + 0.2) * advs
+            loss = -torch.min(surrogate1, surrogate2).mean()
+        return loss.transpose(0, 1)

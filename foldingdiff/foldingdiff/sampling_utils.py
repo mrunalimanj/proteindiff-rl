@@ -276,7 +276,6 @@ def build_datasets(
 # <------------------------- Sampling methods ------------------------------------->
 
 # Needs to sample according probabilities as well. 
-# @torch.no_grad()
 def p_sample(
     model: nn.Module,
     x: torch.Tensor,
@@ -342,8 +341,125 @@ def p_sample(
         # print(f"log probs all neg at time step {t_index}")
         return x_t_minus_1, log_prob
 
+def get_probs_from_samples(
+    model: nn.Module,
+    x: torch.Tensor,
+    x_prev: torch.Tensor,
+    t: torch.Tensor,
+    seq_lens: Sequence[int],
+    t_index: torch.Tensor,
+    betas: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Sample the given timestep. Note that this _may_ fall off the manifold if we just
+    feed the output back into itself repeatedly, so we need to perform modulo on it
+    (see p_sample_loop)
+    """
+    # Calculate alphas and betas
+    alpha_beta_values = beta_schedules.compute_alphas(betas)
+    sqrt_recip_alphas = 1.0 / torch.sqrt(alpha_beta_values["alphas"])
 
-# @torch.no_grad()
+    # Select based on time
+    t_unique = torch.unique(t)
+    assert len(t_unique) == 1, f"Got multiple values for t: {t_unique}"
+    t_index = t_unique.item()
+    sqrt_recip_alphas_t = sqrt_recip_alphas[t_index]
+    betas_t = betas[t_index]
+    sqrt_one_minus_alphas_cumprod_t = alpha_beta_values[
+        "sqrt_one_minus_alphas_cumprod"
+    ][t_index]
+
+    # Create the attention mask
+    attn_mask = torch.zeros(x.shape[:2], device=x.device)
+    for i, length in enumerate(seq_lens):
+        attn_mask[i, :length] = 1.0
+
+    # Equation 11 in the paper
+    # Use our model (noise predictor) to predict the mean
+    # new model mean 
+    model_mean = sqrt_recip_alphas_t * (
+        x
+        - betas_t
+        * model(x, t, attention_mask=attn_mask)
+        / sqrt_one_minus_alphas_cumprod_t
+    )
+
+    if t_index == 0:
+        x_0 = model_mean,
+        # posterior_variance_t = alpha_beta_values["posterior_variance"][t_index]
+        # mean along all but batch dimension # TODO: what is the batch dimension here?
+        # log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim))
+        return torch.zeros_like(model_mean)
+    else:
+        posterior_variance_t = alpha_beta_values["posterior_variance"][t_index]
+        # print out my prob!
+        # log prob of prev_sample given prev_sample_mean and std_dev_t
+        log_prob = (
+            -((x_prev.detach() - model_mean) ** 2) / (2 * (posterior_variance_t))
+            - torch.log(torch.sqrt(posterior_variance_t))
+            - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
+        )
+        # mean along all but batch dimension # TODO: what is the batch dimension here?
+        # log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
+        
+        # print(f"log probs all neg at time step {t_index}")
+        return log_prob
+
+
+def p_probs_loop(
+    model: nn.Module,
+    lengths: Sequence[int],
+    sample: torch.Tensor,
+    timesteps: int,
+    betas: torch.Tensor,
+    is_angle: Union[bool, List[bool]] = [False, True, True, True],
+    disable_pbar: bool = False,
+) -> torch.Tensor:
+    """
+    Returns a tensor of shape (timesteps, batch_size, seq_len, n_ft)
+    """
+    device = next(model.parameters()).device
+    # Report metrics on starting noise
+    # amin and amax support reducing on multiple dimensions
+    
+    probs = []
+
+    for i in tqdm(
+        reversed(range(0, timesteps)),
+        desc="sampling loop time step",
+        total=timesteps,
+        disable=disable_pbar,
+    ):
+        # Shape is (batch, seq_len, 4)
+        img, prob_t = get_probs_from_samples(
+            model=model,
+            x=sample[:, :, i, :],
+            x_prev=sample[:, :, i - 1, :],
+            t=torch.full((sample[:, :, i, :],), i, device=device, dtype=torch.long),  # time vector
+            seq_lens=lengths,
+            t_index=i,
+            betas=betas,
+        )
+        
+        # Wrap if angular
+        if isinstance(is_angle, bool):
+            if is_angle:
+                img = utils.modulo_with_wrapped_range(
+                    img, range_min=-torch.pi, range_max=torch.pi
+                )
+            # consider wrapping probability? 
+            # wrapped pdf is not tractable... oops. 
+        else:
+            assert len(is_angle) == img.shape[-1]
+            for j in range(img.shape[-1]):
+                if is_angle[j]:
+                    img[:, :, j] = utils.modulo_with_wrapped_range(
+                        img[:, :, j], range_min=-torch.pi, range_max=torch.pi
+                    )
+        probs.append(prob_t.cpu())
+    return torch.stack(probs)
+
+
 def p_sample_loop(
     model: nn.Module,
     lengths: Sequence[int],
